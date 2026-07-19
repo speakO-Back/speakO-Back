@@ -1,8 +1,10 @@
 package com.example.speako.domain.user.service;
 
 import com.example.speako.domain.user.dto.UserRequestDTO;
+import com.example.speako.domain.user.dto.UserResponseDTO;
 import com.example.speako.domain.user.entity.User;
 import com.example.speako.domain.user.repository.UserRepository;
+import com.example.speako.global.config.JwtTokenProvider;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -15,6 +17,7 @@ public class UserService {
 
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
+    private final JwtTokenProvider jwtTokenProvider;
 
     @Transactional
     public User signUp(UserRequestDTO.SignUpDTO request) {
@@ -46,4 +49,25 @@ public class UserService {
 
         return userRepository.save(newUser);
     }
-}
+
+        @Transactional
+        public UserResponseDTO.LoginResultDTO login(UserRequestDTO.LoginDTO request) {
+            // 1. 이메일로 유저 조회
+            User user = userRepository.findByEmail(request.getEmail())
+                    .orElseThrow(() -> new IllegalArgumentException("가입되지 않은 이메일입니다."));
+
+            // 2. 비밀번호 검증
+            if (!passwordEncoder.matches(request.getPassword(), user.getPassword())) {
+                throw new IllegalArgumentException("비밀번호가 일치하지 않습니다.");
+            }
+
+            // 3. 인증 성공 시 JWT 토큰 생성
+            String accessToken = jwtTokenProvider.createAccessToken(user.getUserId(), user.getEmail());
+
+            return UserResponseDTO.LoginResultDTO.builder()
+                    .userId(user.getUserId())
+                    .email(user.getEmail())
+                    .accessToken(accessToken)
+                    .build();
+        }
+    }

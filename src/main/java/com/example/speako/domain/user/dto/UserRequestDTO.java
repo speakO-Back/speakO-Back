@@ -33,4 +33,15 @@ public class UserRequestDTO {
         @Size(min = 2, max = 15, message = "닉네임은 2자 이상 15자 이하로 입력해주세요.")
         private String name;
     }
+    @Getter
+    @Setter
+    @NoArgsConstructor
+    public static class LoginDTO {
+        @NotBlank(message = "이메일은 필수 입력값입니다.")
+        @Email(message = "올바른 이메일 형식이 아닙니다.")
+        private String email;
+
+        @NotBlank(message = "비밀번호는 필수 입력값입니다.")
+        private String password;
+    }
 }
