@@ -1,4 +1,4 @@
-package com.example.speako.common;
+package com.example.speako.global.common;
 import lombok.Getter;
 
 @Getter
