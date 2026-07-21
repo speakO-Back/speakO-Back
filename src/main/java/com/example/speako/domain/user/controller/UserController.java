@@ -21,8 +21,9 @@ public class UserController {
     private final UserService userService;
 
     @PostMapping("/signup")
-
-    public ResponseEntity<UserResponseDTO.SignUpResultDTO> signUp(@RequestBody @Valid UserRequestDTO.SignUpDTO request) {
+    public ResponseEntity<ApiResponse<UserResponseDTO.SignUpResultDTO>> signUp(
+            @RequestBody @Valid UserRequestDTO.SignUpDTO request
+    ) {
         User user = userService.signUp(request);
 
         UserResponseDTO.SignUpResultDTO result = UserResponseDTO.SignUpResultDTO.builder()
@@ -32,8 +33,10 @@ public class UserController {
                 .createdAt(user.getCreatedAt())
                 .build();
 
-        return ResponseEntity.ok(result);
+        // ApiResponse.onSuccess 로 감싸서 리턴
+        return ResponseEntity.ok(ApiResponse.onSuccess(result));
     }
+
     @PostMapping("/login")
     public ResponseEntity<ApiResponse<UserResponseDTO.LoginResultDTO>> login(
             @RequestBody @Valid UserRequestDTO.LoginDTO request

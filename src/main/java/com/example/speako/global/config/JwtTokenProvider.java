@@ -15,7 +15,7 @@ public class JwtTokenProvider {
 
     // 테스트용 임시 Secret Key (실무에서는 application.yml에 두고 가져와야 안전합니다)
     private final String secretKey = "yourSpeakoSecretKeyTokenSecretKeyPlaceHereVeryLongLength";
-    private final long tokenValidityInMilliseconds = 1000L * 60 * 60 * 2; // 2시간 유지
+    private final long tokenValidityInMilliseconds = 1000L * 60 * 60 * 24; // 2시간 유지
 
     private Key getSigningKey() {
         byte[] keyBytes = secretKey.getBytes(StandardCharsets.UTF_8);
