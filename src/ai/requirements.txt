@@ -1,0 +1,15 @@
+fastapi==0.138.2
+uvicorn[standard]==0.49.0
+python-dotenv==1.2.2
+requests==2.34.2
+python-pptx==1.0.2
+g2pkk==0.1.2
+azure-cognitiveservices-speech==1.42.0
+python-multipart==0.0.20
+pypdf==6.14.2
+sqlalchemy==2.0.51
+python-docx==1.2.0
+kiwipiepy==0.23.2
+# HCX 비전이 못 받는 이미지 포맷(EMF/WMF/TIFF 등)을 PNG로 변환할 때 사용.
+# python-pptx가 의존성으로 끌고 오지만, 직접 쓰므로 명시한다.
+Pillow==12.3.0
