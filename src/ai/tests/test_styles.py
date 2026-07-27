@@ -8,7 +8,7 @@
 
 import clova.full_generation.generator as generator_module
 from clova.full_generation.generator import FullScriptGenerator
-from clova.styles import STYLE_INSTRUCTIONS, style_instruction
+from clova.styles import STYLE_INSTRUCTIONS, audience_instruction, style_instruction
 
 
 def test_formal_style_forbids_casual_endings():
@@ -74,3 +74,40 @@ def test_style_instruction_is_injected_into_generation_prompt(monkeypatch):
     # 단어("격식체")만이 아니라 어미 지시가 프롬프트에 들어가야 한다.
     assert all("하십시오체" in prompt for prompt in sent)
     assert all("말투" in prompt for prompt in sent)
+
+
+def test_audience_default_when_empty():
+    """대상은 선택 입력 — 비어 있으면 특정 청중을 가정하지 말라고 지시해야 한다(피그마: 발표 주제만 필수)."""
+    inst = audience_instruction("")
+    assert "일반 청중" in inst
+
+
+def test_audience_is_woven_into_instruction():
+    inst = audience_instruction("면접관")
+    assert "면접관" in inst
+
+
+def test_audience_is_injected_into_generation_prompt(monkeypatch):
+    """피그마 '대상' 필드가 생성 프롬프트에 실제로 반영되는지."""
+    generator = FullScriptGenerator()
+    generator.api_key = "test-key"
+    generator.use_fallback = False
+
+    sent = _capture_prompts(monkeypatch)
+    generator.generate_full_script("Slide 1: 첫 내용\nSlide 2: 둘째 내용", 4, "격식체", audience="교수님")
+
+    assert all("교수님" in prompt for prompt in sent)
+    assert all("대상" in prompt for prompt in sent)
+
+
+def test_topic_is_injected_into_generation_prompt(monkeypatch):
+    """피그마의 유일한 필수 입력 '발표 주제'가 생성 프롬프트에 실제로 반영되는지."""
+    generator = FullScriptGenerator()
+    generator.api_key = "test-key"
+    generator.use_fallback = False
+
+    sent = _capture_prompts(monkeypatch)
+    generator.generate_full_script("Slide 1: 첫 내용\nSlide 2: 둘째 내용", 4, "격식체", topic="Clip Route 서비스 소개")
+
+    assert all("Clip Route 서비스 소개" in prompt for prompt in sent)
+    assert all("발표 주제" in prompt for prompt in sent)

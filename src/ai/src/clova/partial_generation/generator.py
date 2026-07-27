@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 from utils.usage_tracker import log_hcx_call
 from clova.toon_parser import parse_toon_slides
-from clova.styles import STYLE_INSTRUCTIONS  # noqa: F401 (기존 임포트 경로 호환)
+from clova.styles import STYLE_INSTRUCTIONS, audience_instruction  # noqa: F401 (STYLE_INSTRUCTIONS: 기존 임포트 경로 호환)
 
 load_dotenv()
 
@@ -21,7 +21,7 @@ class PartialScriptGenerator:
         if self.use_fallback:
             print("⚠️ [경고] HCX_API_KEY가 설정되지 않았습니다. 부분 재생성은 안전 모드(None 반환)로 동작합니다.")
 
-    def generate_partial_script(self, original_script, target_slide, style, extra_requirement=""):
+    def generate_partial_script(self, original_script, target_slide, style, extra_requirement="", audience=""):
         if self.use_fallback:
             return None
         headers = {
@@ -45,6 +45,7 @@ class PartialScriptGenerator:
         """
 
         requirement_text = STYLE_INSTRUCTIONS[style]
+        requirement_text += f"\n대상(청중): {audience_instruction(audience)}"
         if extra_requirement and extra_requirement.strip():
             requirement_text += f"\n추가 요구사항: {extra_requirement.strip()}"
 

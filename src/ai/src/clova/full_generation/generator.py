@@ -10,6 +10,7 @@ from clova.styles import (
     FIRST_SLIDE_INSTRUCTION,
     LAST_SLIDE_INSTRUCTION,
     MIDDLE_SLIDE_INSTRUCTION,
+    audience_instruction as _audience_instruction,
     style_instruction,
 )
 
@@ -97,9 +98,12 @@ class FullScriptGenerator:
         if self.use_fallback:
             print("⚠️ [경고] HCX_API_KEY가 설정되지 않았습니다. 대본 생성은 안전 모드(None 반환)로 동작합니다.")
 
-    def generate_full_script(self, ppt_text, presentation_time, style, extra_requirement=""):
+    def generate_full_script(self, ppt_text, presentation_time, style, extra_requirement="", audience="", topic=""):
         """
         슬라이드를 **한 장씩** 요청해서 결과를 합친다.
+        audience: 발표 대상/청중(예: "교수님", "면접관"). 있으면 그 청중에 맞춘 어조·설명 수준으로 작성.
+        topic: 발표 주제(피그마의 유일한 필수 입력). 슬라이드 원문만으로는 놓치기 쉬운 발표의 큰 줄기를
+               모델에 알려줘, 각 장이 주제에서 벗어나지 않게 한다.
 
         여러 장을 한 번에 넣으면 모델이 어떤 장은 건너뛰고 어떤 장은 두 줄로 쪼개는데,
         그러면 슬라이드와 대본의 정렬이 통째로 밀린다. (실측: 목차 장을 건너뛰는 바람에
@@ -115,7 +119,7 @@ class FullScriptGenerator:
             # 원본이 없거나 한 덩어리(주제/목차 브리프)일 때는 모델이 여러 슬라이드로 "확장"하는 것이
             # 정상 동작이다. PPT 없이 주제만 받은 프로젝트는 이 확장 결과가 곧 슬라이드가 된다.
             # 그러니 여기서는 번호를 손대지 않고 모델이 매긴 그대로 돌려준다.
-            return self._request_raw(ppt_text, presentation_time, style, extra_requirement, None)
+            return self._request_raw(ppt_text, presentation_time, style, extra_requirement, None, audience, topic)
 
         per_slide_time = max(1, round(presentation_time / len(blocks)))
 
@@ -124,7 +128,7 @@ class FullScriptGenerator:
         def build_one(item):
             index, (number, block) = item
             slides = self._request_one_slide(
-                number, block, _position_label(index, len(blocks)), per_slide_time, style, extra_requirement
+                number, block, _position_label(index, len(blocks)), per_slide_time, style, extra_requirement, audience, topic
             )
             return number, slides
 
@@ -146,7 +150,7 @@ class FullScriptGenerator:
         all_slides.sort(key=lambda s: int(s["slide_number"]))
         return {"slides": all_slides}
 
-    def _request_one_slide(self, slide_number, block, position, presentation_time, style, extra_requirement):
+    def _request_one_slide(self, slide_number, block, position, presentation_time, style, extra_requirement, audience="", topic=""):
         """
         한 장만 요청할 때는 **TOON 포맷을 쓰지 않는다.**
         응답 전체가 곧 이 슬라이드의 대본이므로 구분자가 필요 없고, 오히려 껍데기를 요구하면
@@ -158,7 +162,7 @@ class FullScriptGenerator:
         for attempt in range(2):
             text = self._call_hcx(
                 self._SINGLE_SLIDE_PROMPT,
-                self._build_user_prompt(block, presentation_time, style, extra_requirement, position),
+                self._build_user_prompt(block, presentation_time, style, extra_requirement, position, audience, topic),
             )
             script = _clean_single_slide_script(text)
             if script:
@@ -204,13 +208,17 @@ class FullScriptGenerator:
          2,다음으로 넘어가겠습니다. 시장 규모를 살펴보면...
         """
 
-    def _build_user_prompt(self, ppt_text, presentation_time, style, extra_requirement, position):
+    def _build_user_prompt(self, ppt_text, presentation_time, style, extra_requirement, position, audience="", topic=""):
         # [위치]와 [말투] 지시는 프롬프트 맨 뒤에 둔다. 중간에 끼워 넣었더니 모델이 무시하고
         # 장마다 인사말로 시작하거나(19장 중 16장) 해요체로 흘러내렸다.
         # "발표 스타일: 격식체"처럼 단어만 주면 안 되고, 어미까지 문장으로 못박아야 한다.
+        # 발표 주제는 [발표 조건]에 한 줄로만 넣는다 — 규칙을 늘리면 오히려 형식을 못 지키므로
+        # 슬라이드가 주제에서 벗어나지 않을 정도의 '맥락'으로만 제공한다.
         return f"""
         [발표 조건]
         - 발표 시간: {presentation_time}분
+        - 발표 주제: {topic or '자료 내용에서 파악'}
+        - 발표 대상(청중): {audience or '특정하지 않음(일반 청중)'}
 
         [추가 요구사항]
         {extra_requirement or '없음'}
@@ -221,15 +229,18 @@ class FullScriptGenerator:
         [반드시 지킬 것 — 위치]
         {position or '전체 발표 대본을 작성하세요.'}
 
+        [반드시 지킬 것 — 대상]
+        {_audience_instruction(audience)}
+
         [반드시 지킬 것 — 말투]
         {style_instruction(style)}
         """
 
-    def _request_raw(self, ppt_text, presentation_time, style, extra_requirement, valid_slide_numbers):
+    def _request_raw(self, ppt_text, presentation_time, style, extra_requirement, valid_slide_numbers, audience="", topic=""):
         """브리프 한 덩어리를 여러 슬라이드로 확장하는 경로. 여기서만 TOON이 필요하다."""
         toon_text = self._call_hcx(
             self._MULTI_SLIDE_PROMPT,
-            self._build_user_prompt(ppt_text, presentation_time, style, extra_requirement, ""),
+            self._build_user_prompt(ppt_text, presentation_time, style, extra_requirement, "", audience, topic),
         )
         if toon_text is None:
             return None

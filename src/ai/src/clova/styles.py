@@ -44,3 +44,18 @@ LAST_SLIDE_INSTRUCTION = (
 def style_instruction(style):
     """알 수 없는 style이 와도 격식체로 안전하게 폴백한다."""
     return STYLE_INSTRUCTIONS.get(style, STYLE_INSTRUCTIONS["격식체"])
+
+
+def audience_instruction(audience):
+    """
+    발표 대상(청중)을 대본에 반영하도록 지시. 피그마의 '대상' 필드(예: 교수님/면접관)에 대응.
+    비어 있으면(선택 입력, 미입력) 특정 청중을 가정하지 말라고 지시한다.
+    """
+    audience = (audience or "").strip()
+    if not audience:
+        return "특정 청중을 가정하지 말고 일반 청중이 이해할 수 있게 작성하세요."
+    return (
+        f"이 발표의 청중은 '{audience}'입니다. 이 청중에게 말한다고 생각하고, "
+        "그들에게 맞는 존대 수준·용어 난이도·강조점으로 대본을 작성하세요. "
+        "다만 청중 호칭을 억지로 문장마다 넣지는 마세요."
+    )

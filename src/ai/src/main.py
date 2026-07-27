@@ -6,12 +6,13 @@ if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-from fastapi import FastAPI, APIRouter, UploadFile, File, Form, Header, HTTPException, Depends
+from fastapi import FastAPI, APIRouter, UploadFile, File, Form, Header, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import Literal, Optional
+from concurrent.futures import ThreadPoolExecutor
 import uvicorn
 import os
 import re
@@ -32,8 +33,20 @@ from utils import audio_converter
 from utils.text_heuristics import extract_frequent_terms
 from utils.stdict_client import StdictClient
 from utils.hangul_phonology import has_liaison_pattern
-from db.database import get_db, init_db
+from db.database import get_db, init_db, SessionLocal
 from db import models
+from utils import job_store
+
+# 대본 생성은 20~30초 걸리는 무거운 작업이라, 요청을 붙잡고 기다리면 타임아웃에 끊길 수 있다.
+# 그래서 접수번호(job_id)를 즉시 돌려주고 실제 생성은 백그라운드 스레드에서 돌린다.
+# - job_executor: 백그라운드 작업을 돌리는 스레드풀(동시 실행 개수 상한).
+# - job_session_factory: 백그라운드 작업은 요청 수명과 분리되므로 자체 DB 세션을 열어야 한다.
+#   (요청에서 받은 세션은 응답과 함께 닫힌다.) 테스트에서 인메모리 DB로 갈아끼울 수 있게 모듈 변수로 둔다.
+job_executor = ThreadPoolExecutor(
+    max_workers=max(1, int(os.getenv("SCRIPT_JOB_CONCURRENCY", "4"))),
+    thread_name_prefix="script-job",
+)
+job_session_factory = SessionLocal
 
 # 2. FastAPI 앱 인스턴스 생성
 app = FastAPI(
@@ -170,15 +183,49 @@ class FullScriptRequest(BaseModel):
     presentation_time: int
     style: Literal["격식체", "편안한 말투"]
     extra_requirement: Optional[str] = ""
+    audience: Optional[str] = ""  # 발표 대상/청중 (피그마 '대상' 필드, 예: 교수님/면접관). 선택 입력.
+    topic: Optional[str] = ""  # 발표 주제. 비우면 프로젝트에 저장된 주제(생성 시 입력)를 사용한다.
 
 class PartialScriptRequest(BaseModel):
     project_id: int
     target_slide: int
     style: Literal["격식체", "편안한 말투"]
     extra_requirement: Optional[str] = ""
+    audience: Optional[str] = ""  # 발표 대상/청중. 선택 입력.
 
 class AnalysisRequest(BaseModel):
     project_id: int
+
+class SlideUpdateRequest(BaseModel):
+    """결과 화면(피그마 05)에서 사용자가 직접 고친 대본을 저장할 때 쓴다. PPT O는 슬라이드별,
+    PPT X는 1번 슬라이드(전체 대본 한 덩어리)를 이 API로 저장한다."""
+    script: str  # 사용자가 편집한 대본 본문 (빈 문자열 허용 — 내용을 비우는 것도 편집이다)
+    source_content: Optional[str] = None  # 원문도 함께 고칠 일이 있으면 선택적으로 갱신
+
+class SlideCreateRequest(BaseModel):
+    """슬라이드 추가(피그마 05-1 '슬라이드 추가/삭제 가능'). position이 있으면 그 자리에 끼워넣고
+    뒤 슬라이드 번호는 하나씩 밀린다. 없으면 맨 뒤에 붙인다."""
+    position: Optional[int] = None  # 1-based. 이 번호 자리에 삽입. None이면 맨 끝.
+    script: Optional[str] = ""
+    source_content: Optional[str] = ""
+
+
+def _round_scores_in_place(result: dict):
+    """
+    발음 평가 점수를 소수 1자리(0~100)로 정리한다. 프론트는 이 숫자를 그대로 표시만 하므로
+    표시 형태를 백엔드에서 확정하는데, 0~5점 같은 거친 척도로 뭉개지 말고 소수점까지
+    자세히(예: 87.4) 내려줘서 미세한 발음 차이가 드러나게 한다.
+    전체 점수(overall_scores)와 단어별 정확도(words_detail)를 모두 처리.
+    """
+    scores = result.get("overall_scores")
+    if isinstance(scores, dict):
+        for key, value in list(scores.items()):
+            if isinstance(value, (int, float)):
+                scores[key] = round(value, 1)
+    for word in result.get("words_detail") or []:
+        if isinstance(word, dict) and isinstance(word.get("accuracy_score"), (int, float)):
+            word["accuracy_score"] = round(word["accuracy_score"], 1)
+
 
 # ==========================================
 # 🚀 API 엔드포인트(라우터) 정의
@@ -270,10 +317,12 @@ async def create_project(
             if not result["slides"]:
                 raise HTTPException(status_code=422, detail="파일에서 텍스트를 추출하지 못했습니다.")
 
+            # 발표 주제는 피그마에서 유일한 필수 입력이다. 사용자가 직접 적어 보낸 topic이 있으면
+            # 그것을 최우선으로 저장한다(예전엔 자동 감지 topic으로 덮어써서 사용자 입력이 사라졌다).
             project = models.Project(
                 name=project_name or os.path.splitext(file.filename or "project")[0],
                 filename=file.filename,
-                topic=result["metadata"]["topic"],
+                topic=(topic.strip() if topic and topic.strip() else result["metadata"]["topic"]),
                 keywords=result["metadata"]["keywords"],
             )
             project.slides = [
@@ -311,56 +360,102 @@ async def create_project(
         ),
     )
 
-@api.post("/api/script/full")
+def _run_full_script_job(job_id, project_id, ppt_text, presentation_time, style, extra_requirement, audience, topic):
+    """[백그라운드] 실제 대본 생성 + DB 저장. 요청과 분리된 자체 세션을 열고, 끝나면 job_store에 결과를 기록한다.
+    예외가 나도 프로세스가 죽지 않도록 여기서 모두 잡아 '실패'로 표시한다."""
+    db = job_session_factory()
+    try:
+        result = full_generator.generate_full_script(
+            ppt_text, presentation_time, style, extra_requirement, audience, topic
+        )
+        if not result or not result.get("slides"):
+            job_store.fail_job(job_id, "대본 생성에 실패했습니다.")
+            return
+
+        project = db.get(models.Project, project_id)
+        if not project:
+            job_store.fail_job(job_id, "프로젝트를 찾을 수 없습니다.")
+            return
+
+        # PPT 기반 프로젝트는 보통 원본 슬라이드 수와 생성된 슬라이드 수가 같지만,
+        # topic/outline만으로 만든 프로젝트(원본 슬라이드 1개)는 모델이 알아서 여러 슬라이드로 쪼개 생성하기도 한다.
+        # 이 경우 기존에 없는 슬라이드 번호는 새로 만들어서(upsert) 생성 결과가 유실되지 않게 한다.
+        # 새로 만든 슬라이드에는 원본 브리프(주제/목차)를 source_content로 복사해, 재생성 시 근거가 남게 한다.
+        base_source = next((s.source_content for s in project.slides if s.source_content), "")
+        slides_by_number = {s.slide_number: s for s in project.slides}
+        for item in result["slides"]:
+            try:
+                slide_number = int(item["slide_number"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            slide = slides_by_number.get(slide_number)
+            if slide:
+                slide.script = item["script"]
+            else:
+                new_slide = models.Slide(
+                    project_id=project.id, slide_number=slide_number,
+                    source_content=base_source, script=item["script"],
+                )
+                db.add(new_slide)
+                slides_by_number[slide_number] = new_slide
+        db.commit()
+
+        job_store.complete_job(job_id, {"project_id": project_id, "data": result})
+    except Exception as e:
+        print(f"❌ 대본 생성 작업({job_id}) 처리 중 오류: {e}")
+        job_store.fail_job(job_id, "대본 생성 중 서버 오류가 발생했습니다.")
+    finally:
+        db.close()
+
+
+@api.post("/api/script/full", status_code=status.HTTP_202_ACCEPTED)
 async def create_full_script(request: FullScriptRequest, db: Session = Depends(get_db)):
-    """[대본 전체 생성 API] project_id의 슬라이드 원문을 바탕으로 대본을 생성하고, 각 슬라이드에 저장합니다."""
+    """[대본 전체 생성 시작 API] 생성은 20~30초 걸리는 무거운 작업이라 요청을 붙잡지 않는다.
+    접수번호(job_id)를 즉시 돌려주고 실제 생성은 백그라운드에서 진행하며, 프론트는
+    GET /api/script/jobs/{job_id}로 상태를 물어본다(완료되면 결과 포함)."""
     project = db.get(models.Project, request.project_id)
     if not project:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
     if not project.slides:
         raise HTTPException(status_code=422, detail="이 프로젝트에 추출된 슬라이드가 없습니다.")
 
-    # source_content가 None인 슬라이드(이전 라운드에 upsert로 생겨난 것)를 그대로 넣으면
-    # "Slide 2: None" 같은 문자열이 HCX에 전달되므로, None은 빈 문자열로 방어한다.
+    # 생성에 필요한 입력은 지금(요청 세션이 살아있을 때) 값으로 다 뽑아둔다.
+    # 백그라운드 작업은 이 세션을 쓰지 않고 자체 세션을 새로 연다.
+    # source_content가 None인 슬라이드(이전 라운드 upsert로 생긴 것)는 "Slide 2: None"이 되지 않게 빈 문자열로 방어.
     ppt_text = "\n".join(f"Slide {s.slide_number}: {s.source_content or ''}" for s in project.slides)
-    # 대본 생성은 슬라이드 수만큼 HCX를 호출하는 무거운 작업이다(내부에서 동시 호출로 병렬화하지만
-    # 여전히 수 초~십수 초). async 핸들러에서 동기 함수를 그냥 부르면 그동안 이벤트 루프가 막혀
-    # 다른 요청까지 멈추므로, 스레드풀로 오프로드해서 루프를 비워 둔다.
-    result = await run_in_threadpool(
-        full_generator.generate_full_script,
-        ppt_text,
-        request.presentation_time,
-        request.style,
-        request.extra_requirement,
+    # 발표 주제: 요청으로 넘어온 값이 있으면 우선, 없으면 프로젝트 생성 때 저장한 주제를 쓴다.
+    topic = (request.topic or "").strip() or (project.topic or "")
+    project_id = project.id
+
+    # 여기까지 요청 세션은 읽기만 했다. 백그라운드 작업이 자체 세션으로 DB에 쓰기 전에
+    # 이 읽기 트랜잭션을 명시적으로 닫아 읽기 락을 놓는다(운영 이점 + 테스트의 공유 커넥션 충돌 방지).
+    db.rollback()
+
+    job_id = job_store.create_job()
+    job_executor.submit(
+        _run_full_script_job,
+        job_id, project_id, ppt_text, request.presentation_time,
+        request.style, request.extra_requirement, request.audience, topic,
     )
+    return {"success": True, "job_id": job_id, "status": "processing"}
 
-    if not result or not result.get("slides"):
-        raise HTTPException(status_code=502, detail="대본 생성에 실패했습니다.")
 
-    # PPT 기반 프로젝트는 보통 원본 슬라이드 수와 생성된 슬라이드 수가 같지만,
-    # topic/outline만으로 만든 프로젝트(원본 슬라이드 1개)는 모델이 알아서 여러 슬라이드로 쪼개 생성하기도 한다.
-    # 이 경우 기존에 없는 슬라이드 번호는 새로 만들어서(upsert) 생성 결과가 유실되지 않게 한다.
-    # 새로 만든 슬라이드에는 원본 브리프(주제/목차)를 source_content로 복사해, 재생성 시 근거가 남게 한다.
-    base_source = next((s.source_content for s in project.slides if s.source_content), "")
-    slides_by_number = {s.slide_number: s for s in project.slides}
-    for item in result["slides"]:
-        try:
-            slide_number = int(item["slide_number"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        slide = slides_by_number.get(slide_number)
-        if slide:
-            slide.script = item["script"]
-        else:
-            new_slide = models.Slide(
-                project_id=project.id, slide_number=slide_number,
-                source_content=base_source, script=item["script"],
-            )
-            db.add(new_slide)
-            slides_by_number[slide_number] = new_slide
-    db.commit()
+@api.get("/api/script/jobs/{job_id}")
+async def get_script_job(job_id: str):
+    """[대본 생성 상태 조회 API] 프론트가 스피너를 돌리며 1~2초마다 폴링한다.
+    status: processing(처리중) / completed(완료, data 포함) / failed(실패, error 포함)."""
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="해당 작업을 찾을 수 없습니다.")
 
-    return {"success": True, "project_id": project.id, "data": result}
+    response = {"success": True, "job_id": job_id, "status": job["status"]}
+    if job["status"] == "completed":
+        # 완료 시 응답은 기존 동기 방식과 동일한 모양({project_id, data})을 그대로 담는다.
+        response["project_id"] = job["data"]["project_id"]
+        response["data"] = job["data"]["data"]
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+    return response
 
 @api.post("/api/script/partial")
 async def create_partial_script(request: PartialScriptRequest, db: Session = Depends(get_db)):
@@ -378,8 +473,13 @@ async def create_partial_script(request: PartialScriptRequest, db: Session = Dep
     if not original_script:
         raise HTTPException(status_code=422, detail="먼저 /api/script/full로 전체 대본을 생성해주세요.")
 
-    result = partial_generator.generate_partial_script(
-        original_script, request.target_slide, request.style, request.extra_requirement
+    result = await run_in_threadpool(
+        partial_generator.generate_partial_script,
+        original_script,
+        request.target_slide,
+        request.style,
+        request.extra_requirement,
+        request.audience,
     )
 
     if not result or "script" not in result:
@@ -475,13 +575,16 @@ async def evaluate_pronunciation(
             audio_path_for_evaluation = wav_file_path
 
         # Azure 평가 모듈 호출
-        result = azure_evaluator.evaluate_audio(audio_path_for_evaluation, text_to_evaluate)
+        result = await run_in_threadpool(azure_evaluator.evaluate_audio, audio_path_for_evaluation, text_to_evaluate)
 
         # 다른 엔드포인트(/api/script/*)와 동일하게, 실패는 200이 아닌 502로 알린다.
         if result.get("status") != "success":
             raise HTTPException(status_code=502, detail=result.get("message", "발음 평가에 실패했습니다."))
 
-        scores = result.get("scores", {})
+        # 점수는 백엔드에서 소수 1자리(0~100)로 정리해서 내려준다. 프론트는 이 숫자를 그대로 표시만 한다.
+        # (0~5점으로 뭉개지 않고 소수점까지 자세히. Azure는 소수 점수를 주고, evaluate_audio는 overall_scores 키로 반환한다.)
+        _round_scores_in_place(result)
+        scores = result.get("overall_scores", {})
         evaluation = models.PronunciationEvaluation(
             project_id=project.id,
             accuracy_score=scores.get("accuracy"),
@@ -530,6 +633,32 @@ async def list_projects(db: Session = Depends(get_db)):
         ],
     }
 
+@api.get("/api/evaluations")
+async def list_evaluations(db: Session = Depends(get_db)):
+    """[발표 코칭 내역 API] 프로젝트 구분 없이 지난 발음 평가 결과를 최신순으로 나열한다.
+    마이페이지 '발표 코칭 내역' 화면이 프로젝트를 하나씩 열어보지 않고 한 번에 보도록."""
+    evaluations = (
+        db.query(models.PronunciationEvaluation)
+        .order_by(models.PronunciationEvaluation.created_at.desc())
+        .all()
+    )
+    return {
+        "success": True,
+        "data": [
+            {
+                "id": e.id,
+                "project_id": e.project_id,
+                "project_name": e.project.name if e.project else None,
+                "accuracy_score": e.accuracy_score,
+                "fluency_score": e.fluency_score,
+                "completeness_score": e.completeness_score,
+                "pronunciation_score": e.pronunciation_score,
+                "created_at": e.created_at.isoformat(),
+            }
+            for e in evaluations
+        ],
+    }
+
 @api.get("/api/projects/{project_id}")
 async def get_project(project_id: int, db: Session = Depends(get_db)):
     """[프로젝트 상세 조회 API] 슬라이드별 대본, 발음 주의 단어, 평가 히스토리를 함께 반환합니다."""
@@ -564,6 +693,108 @@ async def get_project(project_id: int, db: Session = Depends(get_db)):
             ],
         },
     }
+
+@api.delete("/api/projects/{project_id}")
+async def delete_project(project_id: int, db: Session = Depends(get_db)):
+    """[프로젝트(기록) 삭제 API] 마이페이지에서 지난 기록을 지운다. 슬라이드·발음 주의 단어·평가 이력은
+    관계 cascade로 함께 삭제된다."""
+    project = db.get(models.Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    db.delete(project)
+    db.commit()
+    return {"success": True, "deleted_project_id": project_id}
+
+def _slides_payload(project: "models.Project") -> list:
+    """편집 API들이 공통으로 돌려주는 슬라이드 목록(번호 순)."""
+    return [
+        {"slide_number": s.slide_number, "source_content": s.source_content, "script": s.script}
+        for s in sorted(project.slides, key=lambda s: s.slide_number)
+    ]
+
+
+def _resequence(slides: list) -> None:
+    """정렬된 슬라이드 리스트를 받아 slide_number를 1..N으로 다시 매긴다(추가/삭제 후 빈 번호 방지)."""
+    for index, slide in enumerate(slides, start=1):
+        slide.slide_number = index
+
+
+@api.put("/api/projects/{project_id}/slides/{slide_number}")
+async def update_slide_script(project_id: int, slide_number: int, request: SlideUpdateRequest, db: Session = Depends(get_db)):
+    """[대본 편집 저장 API] 결과 화면에서 사용자가 직접 고친 대본을 저장한다(피그마 05 '수동/자동 저장').
+    PPT O는 슬라이드별로, PPT X는 1번 슬라이드로 저장한다."""
+    project = db.get(models.Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    slide = next((s for s in project.slides if s.slide_number == slide_number), None)
+    if not slide:
+        raise HTTPException(status_code=404, detail="해당 번호의 슬라이드를 찾을 수 없습니다.")
+
+    slide.script = request.script
+    if request.source_content is not None:
+        slide.source_content = request.source_content
+    db.commit()
+    db.refresh(project)
+
+    return {"success": True, "project_id": project.id, "data": {"slides": _slides_payload(project)}}
+
+
+@api.post("/api/projects/{project_id}/slides")
+async def add_slide(project_id: int, request: SlideCreateRequest, db: Session = Depends(get_db)):
+    """[슬라이드 추가 API] position 자리에 새 슬라이드를 끼워넣고 뒤 번호를 하나씩 민다(피그마 05-1).
+    position이 없으면 맨 끝에 추가한다. 추가 후 전체 번호는 1..N으로 유지된다."""
+    project = db.get(models.Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    ordered = sorted(project.slides, key=lambda s: s.slide_number)
+    # position은 1-based. 범위를 벗어나면 맨 끝으로 클램프한다(잘못된 값에도 유실 없이 추가).
+    if request.position is None or request.position > len(ordered):
+        insert_index = len(ordered)
+    else:
+        insert_index = max(0, request.position - 1)
+
+    new_slide = models.Slide(
+        project_id=project.id,
+        slide_number=insert_index + 1,  # _resequence가 곧 다시 매기므로 임시값
+        source_content=request.source_content or "",
+        script=request.script or "",
+    )
+    ordered.insert(insert_index, new_slide)
+    db.add(new_slide)
+    _resequence(ordered)
+    db.commit()
+    db.refresh(project)
+
+    return {"success": True, "project_id": project.id, "added_slide_number": insert_index + 1, "data": {"slides": _slides_payload(project)}}
+
+
+@api.delete("/api/projects/{project_id}/slides/{slide_number}")
+async def delete_slide(project_id: int, slide_number: int, db: Session = Depends(get_db)):
+    """[슬라이드 삭제 API] 슬라이드를 지우고 남은 번호를 1..N으로 다시 매긴다(피그마 05-1).
+    마지막 한 장은 지울 수 없다(대본이 0장이 되면 생성/평가가 불가능하므로)."""
+    project = db.get(models.Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    slide = next((s for s in project.slides if s.slide_number == slide_number), None)
+    if not slide:
+        raise HTTPException(status_code=404, detail="해당 번호의 슬라이드를 찾을 수 없습니다.")
+    if len(project.slides) <= 1:
+        raise HTTPException(status_code=422, detail="최소 1개의 슬라이드는 있어야 합니다.")
+
+    deleted_id = slide.id  # flush 이후엔 삭제된 인스턴스 접근이 불안정하므로 미리 잡아둔다
+    db.delete(slide)
+    db.flush()  # 세션에서 실제로 빠져야 아래 재번호가 올바르게 매겨진다
+    remaining = sorted((s for s in project.slides if s.id != deleted_id), key=lambda s: s.slide_number)
+    _resequence(remaining)
+    db.commit()
+    db.refresh(project)
+
+    return {"success": True, "project_id": project.id, "data": {"slides": _slides_payload(project)}}
+
 
 app.include_router(api)
 

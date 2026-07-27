@@ -305,7 +305,23 @@ def test_create_project_rejects_oversized_file(monkeypatch):
     assert response.status_code == 413
 
 
+def _generate_full_and_wait(payload):
+    """비동기 대본 생성: 접수번호(job_id)를 받고 완료될 때까지 상태를 폴링해 최종 job 응답을 돌려준다.
+    (테스트에서는 작업이 인라인으로 즉시 실행되므로 사실상 한 번의 조회로 끝난다.)"""
+    start = client.post("/api/script/full", json=payload)
+    assert start.status_code == 202, start.text
+    job_id = start.json()["job_id"]
+    for _ in range(50):
+        res = client.get(f"/api/script/jobs/{job_id}")
+        assert res.status_code == 200
+        body = res.json()
+        if body["status"] != "processing":
+            return body
+    raise AssertionError("작업이 완료되지 않았습니다(폴링 초과).")
+
+
 def test_script_full_requires_existing_project():
+    # 프로젝트 존재 확인은 job을 만들기 전에 하므로 POST가 곧바로 404를 낸다.
     response = client.post(
         "/api/script/full",
         json={"project_id": 9999, "presentation_time": 1, "style": "격식체"},
@@ -313,16 +329,36 @@ def test_script_full_requires_existing_project():
     assert response.status_code == 404
 
 
-def test_script_full_fails_without_api_key(monkeypatch, db_session_factory):
-    project_id = _create_project(db_session_factory, [(1, "테스트 슬라이드 내용")])
-    # 키가 없으면 use_fallback=True가 되어 네트워크 호출 없이 None을 반환하고, 서버는 502로 알린다.
-    # (실제 네트워크를 때리지 않으므로 CI/오프라인에서도 결정적으로 동작한다)
-    monkeypatch.setattr(main.full_generator, "use_fallback", True)
+def test_script_full_returns_job_id_immediately(monkeypatch, db_session_factory):
+    """생성 요청은 접수번호(job_id)를 즉시 202로 돌려준다(요청을 붙잡지 않는다)."""
+    project_id = _create_project(db_session_factory, [(1, "내용")])
+    monkeypatch.setattr(main.full_generator, "use_fallback", False)
+    monkeypatch.setattr(full_gen_module.requests, "post",
+                        lambda *a, **k: _FakeResponse({"result": {"message": {"content": "한 문장 대본입니다."}}}))
+
     response = client.post(
         "/api/script/full",
         json={"project_id": project_id, "presentation_time": 1, "style": "격식체"},
     )
-    assert response.status_code == 502
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"]
+    assert body["status"] == "processing"
+
+
+def test_script_job_404_for_unknown_id():
+    assert client.get("/api/script/jobs/does-not-exist").status_code == 404
+
+
+def test_script_full_fails_without_api_key(monkeypatch, db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "테스트 슬라이드 내용")])
+    # 키가 없으면 use_fallback=True가 되어 네트워크 호출 없이 None을 반환한다.
+    # 이제 생성은 백그라운드 작업이므로, 접수는 202로 받고 작업 상태가 'failed'로 끝나야 한다.
+    # (실제 네트워크를 때리지 않으므로 CI/오프라인에서도 결정적으로 동작한다)
+    monkeypatch.setattr(main.full_generator, "use_fallback", True)
+    body = _generate_full_and_wait({"project_id": project_id, "presentation_time": 1, "style": "격식체"})
+    assert body["status"] == "failed"
+    assert body["error"]
 
 
 def test_script_full_parses_real_world_toon_variant_and_saves_to_slides(monkeypatch, db_session_factory):
@@ -342,12 +378,9 @@ def test_script_full_parses_real_world_toon_variant_and_saves_to_slides(monkeypa
     monkeypatch.setattr(main.full_generator, "use_fallback", False)
     monkeypatch.setattr(full_gen_module.requests, "post", lambda *a, **k: _FakeResponse(fake_payload))
 
-    response = client.post(
-        "/api/script/full",
-        json={"project_id": project_id, "presentation_time": 1, "style": "격식체"},
-    )
-    assert response.status_code == 200
-    slides = response.json()["data"]["slides"]
+    body = _generate_full_and_wait({"project_id": project_id, "presentation_time": 1, "style": "격식체"})
+    assert body["status"] == "completed"
+    slides = body["data"]["slides"]
     assert [s["slide_number"] for s in slides] == ["1", "2"]
     assert "메타버스의 개념" in slides[0]["script"]
 
@@ -376,11 +409,8 @@ def test_script_full_creates_new_slides_when_model_splits_more_than_source(monke
     monkeypatch.setattr(main.full_generator, "use_fallback", False)
     monkeypatch.setattr(full_gen_module.requests, "post", lambda *a, **k: _FakeResponse(fake_payload))
 
-    response = client.post(
-        "/api/script/full",
-        json={"project_id": project_id, "presentation_time": 3, "style": "편안한 말투"},
-    )
-    assert response.status_code == 200
+    body = _generate_full_and_wait({"project_id": project_id, "presentation_time": 3, "style": "편안한 말투"})
+    assert body["status"] == "completed"
 
     db = db_session_factory()
     try:
@@ -634,7 +664,7 @@ def test_evaluation_audio_converts_mp3_before_evaluating(monkeypatch, db_session
         evaluated_paths.append(audio_file_path)
         return {
             "status": "success",
-            "scores": {"accuracy": 90.0, "fluency": 90.0, "completeness": 90.0, "pronunciation_score": 90.0},
+            "overall_scores": {"accuracy": 90.0, "fluency": 90.0, "completeness": 90.0, "pronunciation_score": 90.0},
             "words_detail": [],
         }
 
@@ -704,10 +734,12 @@ def test_evaluation_audio_returns_502_on_failure_and_does_not_save(monkeypatch, 
 
 def test_evaluation_audio_saves_history_on_success(monkeypatch, db_session_factory):
     project_id = _create_project(db_session_factory, [(1, "내용")], script_map={1: "테스트 문장입니다."})
+    # Azure는 소수 점수를 overall_scores 키로 준다. 백엔드는 0~5점으로 뭉개지 말고
+    # 소수 1자리(0~100)까지 자세히 내려줘야 한다(미세한 발음 차이가 드러나게).
     fake_result = {
         "status": "success",
-        "scores": {"accuracy": 90.0, "fluency": 85.0, "completeness": 80.0, "pronunciation_score": 88.0},
-        "words_detail": [{"word": "테스트", "accuracy_score": 90.0, "error_type": "None"}],
+        "overall_scores": {"accuracy": 90.44, "fluency": 85.66, "completeness": 80.0, "pronunciation_score": 88.75},
+        "words_detail": [{"word": "테스트", "accuracy_score": 72.73, "error_type": "None"}],
     }
     monkeypatch.setattr(main.azure_evaluator, "evaluate_audio", lambda audio_file_path, reference_text: fake_result)
 
@@ -718,13 +750,20 @@ def test_evaluation_audio_saves_history_on_success(monkeypatch, db_session_facto
         files={"audio_file": ("clip.wav", fake_file, "audio/wav")},
     )
     assert response.status_code == 200
-    assert response.json()["evaluation_id"]
+    body = response.json()
+    assert body["evaluation_id"]
+
+    # 응답 점수는 소수 1자리로 자세히 내려줘야 한다(0~5점으로 압축 금지). 프론트는 그대로 표시만 한다.
+    scores = body["overall_scores"]
+    assert scores == {"accuracy": 90.4, "fluency": 85.7, "completeness": 80.0, "pronunciation_score": 88.8}
+    assert body["words_detail"][0]["accuracy_score"] == 72.7
 
     db = db_session_factory()
     try:
         project = db.get(models.Project, project_id)
         assert len(project.evaluations) == 1
-        assert project.evaluations[0].accuracy_score == 90.0
+        # DB에도 소수점 그대로 저장(키 불일치 버그 회귀 방지 — 예전엔 overall_scores를 못 읽어 None 저장됐음)
+        assert project.evaluations[0].accuracy_score == 90.4
     finally:
         db.close()
 
@@ -745,3 +784,134 @@ def test_list_and_get_project(db_session_factory):
 def test_get_project_returns_404_for_missing_project():
     response = client.get("/api/projects/999999")
     assert response.status_code == 404
+
+
+# ── 대본 편집 저장 (PUT) — 피그마 05 결과 화면의 수동/자동 저장 ──────────────────
+
+def test_update_slide_script_saves_edited_text(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "내용1"), (2, "내용2")], script_map={1: "초안1", 2: "초안2"})
+
+    response = client.put(f"/api/projects/{project_id}/slides/2", json={"script": "사용자가 직접 고친 대본"})
+    assert response.status_code == 200
+
+    db = db_session_factory()
+    try:
+        project = db.get(models.Project, project_id)
+        slide2 = next(s for s in project.slides if s.slide_number == 2)
+        assert slide2.script == "사용자가 직접 고친 대본"
+        # 다른 슬라이드는 건드리지 않는다.
+        slide1 = next(s for s in project.slides if s.slide_number == 1)
+        assert slide1.script == "초안1"
+    finally:
+        db.close()
+
+
+def test_update_slide_script_allows_empty_string(db_session_factory):
+    """빈 문자열로 비우는 것도 편집이다(422가 아니라 저장돼야 한다)."""
+    project_id = _create_project(db_session_factory, [(1, "내용")], script_map={1: "초안"})
+    response = client.put(f"/api/projects/{project_id}/slides/1", json={"script": ""})
+    assert response.status_code == 200
+
+
+def test_update_slide_script_404_for_missing_slide(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "내용")])
+    assert client.put(f"/api/projects/{project_id}/slides/99", json={"script": "x"}).status_code == 404
+    assert client.put("/api/projects/999999/slides/1", json={"script": "x"}).status_code == 404
+
+
+# ── 슬라이드 추가/삭제 (POST/DELETE) — 피그마 05-1 ─────────────────────────────
+
+def test_add_slide_appends_at_end_when_no_position(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B")])
+    response = client.post(f"/api/projects/{project_id}/slides", json={"script": "새 대본"})
+    assert response.status_code == 200
+    slides = response.json()["data"]["slides"]
+    assert [s["slide_number"] for s in slides] == [1, 2, 3]
+    assert slides[2]["script"] == "새 대본"
+
+
+def test_add_slide_inserts_at_position_and_shifts_following(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B"), (3, "C")], script_map={1: "a", 2: "b", 3: "c"})
+    response = client.post(f"/api/projects/{project_id}/slides", json={"position": 2, "script": "끼운 대본"})
+    assert response.status_code == 200
+    slides = response.json()["data"]["slides"]
+    # 1..N 연속 유지 + 2번 자리에 새 슬라이드, 기존 b/c는 뒤로 밀린다.
+    assert [s["slide_number"] for s in slides] == [1, 2, 3, 4]
+    assert [s["script"] for s in slides] == ["a", "끼운 대본", "b", "c"]
+
+
+def test_delete_slide_removes_and_resequences(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B"), (3, "C")], script_map={1: "a", 2: "b", 3: "c"})
+    response = client.delete(f"/api/projects/{project_id}/slides/2")
+    assert response.status_code == 200
+    slides = response.json()["data"]["slides"]
+    # 2번을 지우면 3번이 2번으로 당겨져 1..N이 유지된다.
+    assert [s["slide_number"] for s in slides] == [1, 2]
+    assert [s["script"] for s in slides] == ["a", "c"]
+
+
+def test_delete_last_remaining_slide_is_rejected(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "only")])
+    response = client.delete(f"/api/projects/{project_id}/slides/1")
+    assert response.status_code == 422
+
+
+def test_delete_slide_404_for_missing(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B")])
+    assert client.delete(f"/api/projects/{project_id}/slides/99").status_code == 404
+    assert client.delete("/api/projects/999999/slides/1").status_code == 404
+
+
+# ── 프로젝트(기록) 삭제 + 발표 코칭 내역 — 마이페이지 ─────────────────────────
+
+def _add_evaluation(db_session_factory, project_id, accuracy):
+    db = db_session_factory()
+    try:
+        db.add(models.PronunciationEvaluation(
+            project_id=project_id, accuracy_score=accuracy, fluency_score=90.0,
+            completeness_score=100.0, pronunciation_score=88.5, words_detail=[],
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_delete_project_removes_it_and_cascades(db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B")], script_map={1: "a", 2: "b"})
+    _add_evaluation(db_session_factory, project_id, 91.2)
+
+    response = client.delete(f"/api/projects/{project_id}")
+    assert response.status_code == 200
+    assert response.json()["deleted_project_id"] == project_id
+
+    # 프로젝트와 함께 슬라이드·평가가 cascade로 사라진다.
+    assert client.get(f"/api/projects/{project_id}").status_code == 404
+    db = db_session_factory()
+    try:
+        assert db.get(models.Project, project_id) is None
+        assert db.query(models.Slide).filter_by(project_id=project_id).count() == 0
+        assert db.query(models.PronunciationEvaluation).filter_by(project_id=project_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_delete_project_404_for_missing():
+    assert client.delete("/api/projects/999999").status_code == 404
+
+
+def test_list_evaluations_returns_all_newest_first(db_session_factory):
+    p1 = _create_project(db_session_factory, [(1, "A")])
+    p2 = _create_project(db_session_factory, [(1, "B")])
+    _add_evaluation(db_session_factory, p1, 70.5)
+    _add_evaluation(db_session_factory, p2, 85.3)
+
+    response = client.get("/api/evaluations")
+    assert response.status_code == 200
+    data = response.json()["data"]
+    # 두 프로젝트의 평가가 프로젝트 구분 없이 한 목록으로 나온다.
+    project_ids = {e["project_id"] for e in data}
+    assert {p1, p2} <= project_ids
+    # 각 항목은 어느 프로젝트인지(project_name)와 점수를 포함한다.
+    sample = next(e for e in data if e["project_id"] == p2)
+    assert sample["project_name"] == "테스트 프로젝트"
+    assert sample["accuracy_score"] == 85.3
