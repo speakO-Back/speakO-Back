@@ -8,10 +8,8 @@ import com.example.speako.global.common.ApiResponse;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequiredArgsConstructor
@@ -44,5 +42,52 @@ public class UserController {
         UserResponseDTO.LoginResultDTO result = userService.login(request);
 
         return ResponseEntity.ok(ApiResponse.onSuccess(result));
+    }
+    //이름변경
+    @PatchMapping("/name")
+    public ResponseEntity<ApiResponse<Void>> updateName(
+            Authentication authentication,
+            @RequestBody @Valid UserRequestDTO.UpdateNameDTO request
+    ) {
+        String email = authentication.getName(); // JWT 토큰에서 추출된 이메일
+        userService.updateName(email, request);
+        return ResponseEntity.ok(ApiResponse.onSuccess(null));
+    }
+    //이메일변경
+    @PatchMapping("/email")
+    public ResponseEntity<ApiResponse<Void>> updateEmail(
+            Authentication authentication,
+            @RequestBody @Valid UserRequestDTO.UpdateEmailDTO request
+    ) {
+        String email = authentication.getName();
+        userService.updateEmail(email, request);
+        return ResponseEntity.ok(ApiResponse.onSuccess(null));
+    }
+    //비밀번호 변경
+    @PatchMapping("/password")
+    public ResponseEntity<ApiResponse<Void>> updatePassword(
+            Authentication authentication,
+            @RequestBody @Valid UserRequestDTO.UpdatePasswordDTO request
+    ) {
+        String email = authentication.getName();
+        userService.updatePassword(email, request);
+        return ResponseEntity.ok(ApiResponse.onSuccess(null));
+    }
+    //회원탈퇴
+    @DeleteMapping("/withdraw")
+    public ResponseEntity<ApiResponse<Void>> withdraw(
+            Authentication authentication,
+            @RequestBody @Valid UserRequestDTO.WithdrawDTO request
+    ) {
+        String email = authentication.getName();
+        userService.withdraw(email, request.getPassword());
+        return ResponseEntity.ok(ApiResponse.onSuccess(null));
+    }
+    //로그아웃
+    @PostMapping("/logout")
+    public ResponseEntity<ApiResponse<Void>> logout(Authentication authentication) {
+        String email = authentication.getName();
+        userService.logout(email);
+        return ResponseEntity.ok(ApiResponse.onSuccess(null));
     }
 }

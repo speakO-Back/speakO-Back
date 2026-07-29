@@ -7,6 +7,7 @@ import jakarta.validation.constraints.Size;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.springframework.security.core.parameters.P;
 
 public class UserRequestDTO {
     @Getter
@@ -41,6 +42,53 @@ public class UserRequestDTO {
         @Email(message = "올바른 이메일 형식이 아닙니다.")
         private String email;
 
+        @NotBlank(message = "비밀번호는 필수 입력값입니다.")
+        private String password;
+    }
+
+    @Getter
+    @Setter
+    @NoArgsConstructor
+    public static class UpdateNameDTO{
+        @NotBlank(message = "변경할 이름은 필수 입력값입니다.")
+        @Size(min = 2, max = 15, message = "닉네임은 2자 이상 15자 이하로 입력해주세요.")
+        private String name;
+    }
+
+    @Getter
+    @Setter
+    @NoArgsConstructor
+    public static class UpdateEmailDTO{
+        @NotBlank(message = "새 이메일은 필수 입력값입니다.")
+        @Email(message = "올바른 이메일 형식이 아닙니다.")
+        private String newEmail;
+
+        @NotBlank(message = "현재 비밀번호는 필수 입력값입니다.")
+        private String currentPassword;
+    }
+
+    @Getter
+    @Setter
+    @NoArgsConstructor
+    public static class UpdatePasswordDTO {
+        @NotBlank(message = "현재 비밀번호는 필수 입력값입니다.")
+        private String currentPassword;
+
+        @NotBlank(message = "새 비밀번호는 필수 입력값입니다.")
+        @Pattern(
+                regexp = "^(?=.*[A-Za-z])(?=.*\\d)(?=.*[@$!%*#?&])[A-Za-z\\d@$!%*#?&]{8,25}$",
+                message = "비밀번호는 8자 이상 25자 이하의 영문, 숫자, 특수문자 조합이어야 합니다."
+        )
+        private String newPassword;
+
+        @NotBlank(message = "새 비밀번호 확인은 필수 입력값입니다.")
+        private String newPasswordCheck;
+    }
+
+    @Getter
+    @Setter
+    @NoArgsConstructor
+    public static class WithdrawDTO {
         @NotBlank(message = "비밀번호는 필수 입력값입니다.")
         private String password;
     }

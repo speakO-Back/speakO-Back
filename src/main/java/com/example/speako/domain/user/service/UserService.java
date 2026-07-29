@@ -70,4 +70,79 @@ public class UserService {
                     .accessToken(accessToken)
                     .build();
         }
+
+        //이름 수정
+        @Transactional
+        public void updateName(String email, UserRequestDTO.UpdateNameDTO request) {
+            User user = userRepository.findByEmail(email)
+                    .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+            // 닉네임 중복 검증
+            if (userRepository.existsByName(request.getName())) {
+                throw new IllegalArgumentException("이미 사용 중인 닉네임입니다.");
+            }
+
+            user.updateName(request.getName());
+        }
+
+        //이메일 변경
+        @Transactional
+        public void updateEmail(String email, UserRequestDTO.UpdateEmailDTO request) {
+            User user = userRepository.findByEmail(email)
+                    .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+            // 현재 비밀번호 검증
+            if (!passwordEncoder.matches(request.getCurrentPassword(), user.getPassword())) {
+                throw new IllegalArgumentException("현재 비밀번호가 일치하지 않습니다.");
+            }
+
+            // 새 이메일 중복 검증
+            if (userRepository.findByEmail(request.getNewEmail()).isPresent()) {
+                throw new IllegalArgumentException("이미 사용 중인 이메일입니다.");
+            }
+
+            user.updateEmail(request.getNewEmail());
+        }
+    //비밀번호 변경
+    @Transactional
+    public void updatePassword(String email, UserRequestDTO.UpdatePasswordDTO request) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+        // 현재 비밀번호 검증
+        if (!passwordEncoder.matches(request.getCurrentPassword(), user.getPassword())) {
+            throw new IllegalArgumentException("현재 비밀번호가 일치하지 않습니다.");
+        }
+
+        // 새 비밀번호와 확인 일치 검증
+        if (!request.getNewPassword().equals(request.getNewPasswordCheck())) {
+            throw new IllegalArgumentException("새로 입력한 비밀번호와 확인이 일치하지 않습니다.");
+        }
+
+        // 새 비밀번호 암호화 후 저장
+        String encodedNewPassword = passwordEncoder.encode(request.getNewPassword());
+        user.updatePassword(encodedNewPassword);
     }
+
+    // 회원 탈퇴 (비밀번호 확인)
+    @Transactional
+    public void withdraw(String email, String password) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+        // 비밀번호 검증
+        if (!passwordEncoder.matches(password, user.getPassword())) {
+            throw new IllegalArgumentException("비밀번호가 일치하지 않습니다.");
+        }
+
+        userRepository.delete(user);
+    }
+
+    // 로그아웃
+    @Transactional
+    public void logout(String email) {
+        // JWT Stateless 환경에서는 보통 클라이언트 측에서 토큰을 삭제하도록 유도합니다.
+        // 만약 서버 측에서 Refresh Token을 관리하고 있다면 여기서 토큰을 삭제하는 로직을 추가합니다.
+    }
+}
+
