@@ -33,21 +33,30 @@ class StdictClient:
             print("⚠️ 장단음 판정은 호출자 쪽 안전 모드(Fallback, 항상 False)에 맡깁니다.\n")
 
     def has_long_vowel(self, word: str) -> bool:
+        return bool(self.long_vowel_positions(word))
+
+    def long_vowel_positions(self, word: str) -> tuple:
+        """장음이 붙는 음절의 0-based 인덱스들을 돌려준다 (장음이 없으면 빈 튜플).
+
+        여부(bool)만으로는 부족하다 — 피그마 단어 목록은 `구성 › [구ː성]`처럼 **어느 음절을**
+        길게 읽는지 보여준다. "장단음"이라고 분류해놓고 위치를 안 주면 사용자가 무엇을 길게
+        발음해야 하는지 알 수 없어서 그 카테고리 자체가 쓸모없어진다.
+        """
         if self.use_fallback or not word or not word.strip():
-            return False
+            return ()
 
         word = word.strip()
         if word in self._cache:
             return self._cache[word]
 
-        result = False
+        result = ()
         try:
             target_code = self._find_target_code(word)
             if target_code:
-                result = self._pronunciation_has_length_mark(target_code)
+                result = self._length_mark_positions(target_code)
         except Exception as e:
             print(f"❌ 표준국어대사전 API 호출 중 에러가 발생했습니다: {e}")
-            result = False
+            result = ()
 
         self._cache[word] = result
         return result
@@ -72,7 +81,20 @@ class StdictClient:
             items = [items]
         return items[0].get("target_code") if items else None
 
-    def _pronunciation_has_length_mark(self, target_code: str) -> bool:
+    @staticmethod
+    def _positions_in(pronunciation: str) -> tuple:
+        """'구ː성' → (0,). 장음 기호는 그것이 붙는 음절 **뒤에** 오므로 직전 음절의 인덱스로 센다."""
+        positions = []
+        syllable_index = -1
+        for char in pronunciation:
+            if char == LENGTH_MARK:
+                if syllable_index >= 0:
+                    positions.append(syllable_index)
+            elif not char.isspace():
+                syllable_index += 1
+        return tuple(positions)
+
+    def _length_mark_positions(self, target_code: str) -> tuple:
         response = requests.get(
             VIEW_ENDPOINT,
             params={"key": self.api_key, "q": target_code, "method": "target_code"},
@@ -88,5 +110,5 @@ class StdictClient:
         root = ET.fromstring(response.content)
         for pronunciation_el in root.findall(".//pronunciation_info/pronunciation"):
             if pronunciation_el.text and LENGTH_MARK in pronunciation_el.text:
-                return True
-        return False
+                return self._positions_in(pronunciation_el.text)
+        return ()

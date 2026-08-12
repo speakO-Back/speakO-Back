@@ -510,9 +510,13 @@ def test_analysis_words_uses_kiwi_when_etri_unavailable(db_session_factory):
     assert body["success"] is True
     words = [w["word"] for w in body["data"]["words"]]
     assert len(words) > 0
-    # Kiwi가 조사를 떼고 명사만 뽑았는지 — "메타버스"가 온전히(조사 없이) 잡혀야 한다.
-    assert "메타버스" in words
     assert set(body["data"]["summary"].keys()) == {"장단음", "연음", "표기-발음불일치"}
+
+    # "조사를 떼고 명사만 뽑았는가"는 추출 단계의 책임이므로 그 계층에서 확인한다.
+    # API 응답은 발음상 주의할 게 없는 단어를 걸러내므로("메타버스"는 철자=발음이고 장단음도
+    # 아니라 빠진다) 여기서 특정 단어를 기대하면 걸러내기 규칙과 함께 깨진다.
+    extracted = main.kiwi_analyzer.extract_difficult_words("메타버스와 인프라 구축의 특징을 살펴봅시다.")
+    assert "메타버스" in extracted, "Kiwi가 조사를 떼고 명사를 온전히 뽑지 못했습니다"
 
 
 def test_analysis_words_classifies_into_categories_and_persists(monkeypatch, db_session_factory):
@@ -562,18 +566,21 @@ def test_analysis_words_long_vowel_fires_even_when_spelling_matches_pronunciatio
     assert data["summary"]["장단음"] == 1
 
 
-def test_analysis_words_category_none_when_not_different_and_not_long_vowel(monkeypatch, db_session_factory):
-    # 철자=발음이고 장단음도 아니면 분류하지 않는다(None) — 이 early-return 분기의 회귀 방지.
+def test_analysis_words_drops_word_with_no_pronunciation_issue(monkeypatch, db_session_factory):
+    # 철자=발음이고 장단음도 아니면 분류가 없다(None) = 발음상 주의할 게 없다는 뜻이다.
+    # 그런 단어는 '발음 주의 단어' 목록에서 아예 빼야 한다 — 넣으면 피그마 화면에서
+    # 뱃지도 설명도 빈 줄이 된다(실측 2026-08-06: 실제 대본에서 40개 중 25개가 여기 해당).
     project_id = _create_project(db_session_factory, [(1, "내용")], script_map={1: "가구 배치."})
     monkeypatch.setattr(main.etri_analyzer, "extract_difficult_words", lambda script_text: ["가구"])
     monkeypatch.setattr(main.g2p_converter, "convert_words",
                         lambda words: [{"word": "가구", "phoneme": "[가구]", "is_different": False}])
     monkeypatch.setattr(main.stdict_client, "has_long_vowel", lambda word: False)
+    monkeypatch.setattr(main.stdict_client, "long_vowel_positions", lambda word: ())
 
     response = client.post("/api/analysis/words", json={"project_id": project_id})
     assert response.status_code == 200
     data = response.json()["data"]
-    assert data["words"][0]["category"] is None
+    assert data["words"] == [], "발음상 주의할 게 없는 단어가 목록에 남아 있습니다"
     assert data["summary"] == {"장단음": 0, "연음": 0, "표기-발음불일치": 0}
 
 
@@ -899,6 +906,82 @@ def test_delete_project_404_for_missing():
     assert client.delete("/api/projects/999999").status_code == 404
 
 
+def _create_evaluation(db_session_factory, project_id, words_detail=None):
+    db = db_session_factory()
+    try:
+        evaluation = models.PronunciationEvaluation(
+            project_id=project_id, accuracy_score=87.4, fluency_score=82.1,
+            completeness_score=95.0, pronunciation_score=86.0,
+            words_detail=words_detail if words_detail is not None else
+            [{"word": "특징을", "accuracy_score": 50.0, "error_type": "Mispronunciation"}],
+        )
+        db.add(evaluation)
+        db.commit()
+        db.refresh(evaluation)
+        return evaluation.id
+    finally:
+        db.close()
+
+
+def test_evaluation_feedback_generates_and_saves(monkeypatch, db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "내용")], script_map={1: "메타버스를 소개합니다."})
+    evaluation_id = _create_evaluation(db_session_factory, project_id)
+
+    monkeypatch.setattr(
+        main.feedback_generator, "generate_feedback",
+        lambda overall_scores, weak_words, script_excerpt="", strong_words=None: {
+            "summary": "전반적으로 또렷합니다.", "strengths": ["속도가 일정합니다."],
+            "improvements": ["받침을 끝까지 발음하세요."], "practice_tips": ["천천히 3번 읽어보세요."],
+        },
+    )
+
+    response = client.post(f"/api/evaluation/{evaluation_id}/feedback")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["cached"] is False
+    assert body["data"]["summary"] == "전반적으로 또렷합니다."
+    # 어떤 단어를 근거로 지적했는지 함께 내려준다.
+    assert body["data"]["weak_words"][0]["word"] == "특징을"
+
+    # 조회 API에도 피드백이 실려 나온다.
+    detail = client.get(f"/api/projects/{project_id}").json()["data"]
+    assert detail["evaluations"][0]["feedback"]["summary"] == "전반적으로 또렷합니다."
+
+
+def test_evaluation_feedback_is_cached_and_not_regenerated(monkeypatch, db_session_factory):
+    """이미 만든 피드백이 있으면 HCX를 다시 부르지 않는다(불필요한 비용 방지)."""
+    project_id = _create_project(db_session_factory, [(1, "내용")], script_map={1: "대본"})
+    evaluation_id = _create_evaluation(db_session_factory, project_id)
+
+    calls = []
+
+    def fake_generate(overall_scores, weak_words, script_excerpt="", strong_words=None):
+        calls.append(1)
+        return {"summary": "첫 생성", "strengths": [], "improvements": [], "practice_tips": []}
+
+    monkeypatch.setattr(main.feedback_generator, "generate_feedback", fake_generate)
+
+    first = client.post(f"/api/evaluation/{evaluation_id}/feedback").json()
+    second = client.post(f"/api/evaluation/{evaluation_id}/feedback").json()
+
+    assert first["cached"] is False and second["cached"] is True
+    assert second["data"]["summary"] == "첫 생성"
+    assert len(calls) == 1, "두 번째 호출에서 HCX를 다시 부르면 안 된다"
+
+
+def test_evaluation_feedback_502_when_generation_fails(monkeypatch, db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "내용")])
+    evaluation_id = _create_evaluation(db_session_factory, project_id)
+    monkeypatch.setattr(main.feedback_generator, "generate_feedback",
+                        lambda overall_scores, weak_words, script_excerpt="", strong_words=None: None)
+
+    assert client.post(f"/api/evaluation/{evaluation_id}/feedback").status_code == 502
+
+
+def test_evaluation_feedback_404_for_missing_evaluation():
+    assert client.post("/api/evaluation/999999/feedback").status_code == 404
+
+
 def test_list_evaluations_returns_all_newest_first(db_session_factory):
     p1 = _create_project(db_session_factory, [(1, "A")])
     p2 = _create_project(db_session_factory, [(1, "B")])
@@ -915,3 +998,253 @@ def test_list_evaluations_returns_all_newest_first(db_session_factory):
     sample = next(e for e in data if e["project_id"] == p2)
     assert sample["project_name"] == "테스트 프로젝트"
     assert sample["accuracy_score"] == 85.3
+
+
+# ── CORS (배포된 프론트엔드가 브라우저에서 직접 호출할 수 있어야 함) ──────────────
+
+def test_cors_allows_deployed_frontend_origin():
+    """localhost만 허용하면 배포된 프론트(vercel)에서 호출 시 브라우저가 전부 차단한다."""
+    response = client.options(
+        "/api/projects",
+        headers={
+            "Origin": "https://speakofront.vercel.app",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert response.status_code in (200, 204)
+    assert response.headers.get("access-control-allow-origin") == "https://speakofront.vercel.app"
+
+
+def test_cors_allows_vercel_preview_domains():
+    """Vercel 프리뷰는 커밋마다 도메인이 바뀌므로 정규식으로도 허용돼야 한다."""
+    origin = "https://speakofront-abc123-team.vercel.app"
+    response = client.options(
+        "/api/projects",
+        headers={"Origin": origin, "Access-Control-Request-Method": "GET"},
+    )
+    assert response.headers.get("access-control-allow-origin") == origin
+
+
+def test_cors_still_allows_localhost_for_dev():
+    response = client.options(
+        "/api/projects",
+        headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "GET"},
+    )
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+
+def test_cors_origin_list_is_configurable():
+    """환경변수로 배포 도메인을 바꿀 수 있어야 한다(도메인 변경 시 코드 수정 없이)."""
+    assert main._parse_origins("https://a.com, https://b.com/") == ["https://a.com", "https://b.com"]
+    # 비어 있으면 기본 목록으로 폴백한다.
+    assert main._parse_origins("") == main.DEFAULT_ALLOWED_ORIGINS
+    assert "https://speakofront.vercel.app" in main._parse_origins("")
+
+
+# ── 원본 텍스트 ↔ 인식 텍스트 (피그마 Feedback Page 좌우 비교) ──────────────────
+
+def test_evaluation_saves_and_returns_recognized_text(monkeypatch, db_session_factory):
+    """점수만으로는 어디를 잘못 읽었는지 알 수 없다. Azure가 실제로 들은 문장을 함께 저장·반환해야 한다."""
+    project_id = _create_project(db_session_factory, [(1, "내용")], script_map={1: "메타버스를 소개합니다."})
+    fake_result = {
+        "status": "success",
+        "overall_scores": {"accuracy": 90.0, "fluency": 90.0, "completeness": 90.0, "pronunciation_score": 90.0},
+        "recognized_text": "메타버스를 소개함니다",
+        "words_detail": [{"word": "메타버스를", "accuracy_score": 90.0, "error_type": "None"}],
+    }
+    monkeypatch.setattr(main.azure_evaluator, "evaluate_audio", lambda audio_file_path, reference_text: fake_result)
+
+    response = client.post(
+        "/api/evaluation/audio",
+        data={"project_id": str(project_id)},
+        files={"audio_file": ("clip.wav", io.BytesIO(b"RIFF....WAVEfmt "), "audio/wav")},
+    )
+    assert response.status_code == 200
+    assert response.json()["recognized_text"] == "메타버스를 소개함니다"
+
+    # 조회 API에서 원본 대본과 인식 텍스트를 나란히 받을 수 있어야 한다.
+    detail = client.get(f"/api/projects/{project_id}").json()["data"]["evaluations"][0]
+    assert detail["recognized_text"] == "메타버스를 소개함니다"
+    assert detail["reference_text"] == "Slide 1: 메타버스를 소개합니다."
+
+    listed = client.get("/api/evaluations").json()["data"][0]
+    assert listed["recognized_text"] == "메타버스를 소개함니다"
+    assert listed["reference_text"]
+
+
+# ── 슬라이드별 부분 녹음 평가 ────────────────────────────────────────────────
+
+def _fake_eval_result():
+    return {
+        "status": "success",
+        "overall_scores": {"accuracy": 88.0, "fluency": 85.0, "completeness": 92.0, "pronunciation_score": 87.0},
+        "recognized_text": "인식된 문장",
+        "words_detail": [{"word": "발전", "accuracy_score": 60.0, "error_type": "Mispronunciation"}],
+    }
+
+
+def test_evaluation_with_slide_number_uses_only_that_slide_script(monkeypatch, db_session_factory):
+    """슬라이드별로 녹음하면 그 장 대본만 기준으로 채점해야 한다.
+    전체 대본을 기준으로 잡으면 한 장만 읽었을 때 완성도가 바닥으로 나온다."""
+    project_id = _create_project(
+        db_session_factory, [(1, "A"), (2, "B")], script_map={1: "첫 번째 장 대본", 2: "두 번째 장 대본"}
+    )
+    seen = {}
+
+    def fake_eval(audio_file_path, reference_text):
+        seen["reference"] = reference_text
+        return _fake_eval_result()
+
+    monkeypatch.setattr(main.azure_evaluator, "evaluate_audio", fake_eval)
+
+    response = client.post(
+        "/api/evaluation/audio",
+        data={"project_id": str(project_id), "slide_number": "2"},
+        files={"audio_file": ("clip.wav", io.BytesIO(b"RIFF"), "audio/wav")},
+    )
+    assert response.status_code == 200
+    # 전체 대본이 아니라 2번 슬라이드 대본만 기준이 돼야 한다.
+    assert seen["reference"] == "두 번째 장 대본"
+    assert response.json()["slide_number"] == 2
+
+
+def test_evaluation_records_slide_number_in_history(monkeypatch, db_session_factory):
+    """코칭 내역에서 '3번 슬라이드 87점'처럼 구분하려면 슬라이드 번호가 남아야 한다."""
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B")], script_map={1: "가", 2: "나"})
+    monkeypatch.setattr(main.azure_evaluator, "evaluate_audio", lambda audio_file_path, reference_text: _fake_eval_result())
+
+    client.post(
+        "/api/evaluation/audio",
+        data={"project_id": str(project_id), "slide_number": "2"},
+        files={"audio_file": ("clip.wav", io.BytesIO(b"RIFF"), "audio/wav")},
+    )
+
+    listed = client.get("/api/evaluations").json()["data"][0]
+    assert listed["slide_number"] == 2
+    detail = client.get(f"/api/projects/{project_id}").json()["data"]["evaluations"][0]
+    assert detail["slide_number"] == 2
+
+
+def test_evaluation_without_slide_number_stays_null(monkeypatch, db_session_factory):
+    """대본 전체를 한 번에 녹음한 경우는 슬라이드 번호가 없다(기존 동작 유지)."""
+    project_id = _create_project(db_session_factory, [(1, "A")], script_map={1: "전체 대본"})
+    monkeypatch.setattr(main.azure_evaluator, "evaluate_audio", lambda audio_file_path, reference_text: _fake_eval_result())
+
+    response = client.post(
+        "/api/evaluation/audio",
+        data={"project_id": str(project_id)},
+        files={"audio_file": ("clip.wav", io.BytesIO(b"RIFF"), "audio/wav")},
+    )
+    assert response.status_code == 200
+    assert response.json()["slide_number"] is None
+
+
+def test_evaluation_rejects_unknown_or_empty_slide(monkeypatch, db_session_factory):
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B")], script_map={1: "가"})
+    monkeypatch.setattr(main.azure_evaluator, "evaluate_audio", lambda audio_file_path, reference_text: _fake_eval_result())
+
+    # 없는 슬라이드 번호
+    missing = client.post(
+        "/api/evaluation/audio",
+        data={"project_id": str(project_id), "slide_number": "99"},
+        files={"audio_file": ("clip.wav", io.BytesIO(b"RIFF"), "audio/wav")},
+    )
+    assert missing.status_code == 404
+
+    # 대본이 아직 없는 슬라이드
+    empty = client.post(
+        "/api/evaluation/audio",
+        data={"project_id": str(project_id), "slide_number": "2"},
+        files={"audio_file": ("clip.wav", io.BytesIO(b"RIFF"), "audio/wav")},
+    )
+    assert empty.status_code == 422
+
+
+def test_reference_text_wins_over_slide_number(monkeypatch, db_session_factory):
+    """reference_text를 직접 주면 그게 우선이다."""
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B")], script_map={1: "가", 2: "나"})
+    seen = {}
+
+    def fake_eval(audio_file_path, reference_text):
+        seen["reference"] = reference_text
+        return _fake_eval_result()
+
+    monkeypatch.setattr(main.azure_evaluator, "evaluate_audio", fake_eval)
+    client.post(
+        "/api/evaluation/audio",
+        data={"project_id": str(project_id), "slide_number": "2", "reference_text": "직접 준 문장"},
+        files={"audio_file": ("clip.wav", io.BytesIO(b"RIFF"), "audio/wav")},
+    )
+    assert seen["reference"] == "직접 준 문장"
+
+
+def test_partial_regeneration_survives_header_only_response(monkeypatch, db_session_factory):
+    """모델이 TOON 헤더만 붙이고 본문은 평문으로 줘도 대본을 살려야 한다(실측 502 회귀 방지)."""
+    project_id = _create_project(db_session_factory, [(1, "A"), (2, "B")], script_map={1: "가", 2: "나"})
+    raw = "slides[2]{slide_number,script}: \n자 그럼 이제 발표를 시작해볼게요! 집중해 주세요."
+    monkeypatch.setattr(main.partial_generator, "use_fallback", False)
+    monkeypatch.setattr(
+        partial_gen_module.requests, "post",
+        lambda *a, **k: _FakeResponse({"result": {"message": {"content": raw}}}),
+    )
+
+    response = client.post(
+        "/api/script/partial",
+        json={"project_id": project_id, "target_slide": 2, "style": "편안한 말투"},
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["script"] == "자 그럼 이제 발표를 시작해볼게요! 집중해 주세요."
+    # 요청자가 지정한 슬라이드에 저장돼야 한다 (모델이 매긴 번호를 믿으면 안 됨).
+    assert data["slide_number"] == "2"
+
+    db = db_session_factory()
+    try:
+        project = db.get(models.Project, project_id)
+        saved = {s.slide_number: s.script for s in project.slides}
+        assert saved[2] == "자 그럼 이제 발표를 시작해볼게요! 집중해 주세요."
+        assert saved[1] == "가", "다른 슬라이드는 건드리면 안 된다"
+    finally:
+        db.close()
+
+
+def test_partial_regeneration_includes_slide_source_content(monkeypatch, db_session_factory):
+    """대상 슬라이드의 원문을 넘겨야 모델이 그 장이 무슨 내용인지 알고 다시 쓸 수 있다.
+    (원문이 없으면 앞뒤 대본만 보고 지어낸다 — 특히 아직 대본이 없는 슬라이드)"""
+    project_id = _create_project(
+        db_session_factory, [(1, "첫 장 원문"), (2, "시장 규모와 성장률 도표")], script_map={1: "가"}
+    )
+    sent = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        sent["prompt"] = json["messages"][-1]["content"][0]["text"]
+        return _FakeResponse({"result": {"message": {"content": "다시 쓴 대본입니다."}}})
+
+    monkeypatch.setattr(main.partial_generator, "use_fallback", False)
+    monkeypatch.setattr(partial_gen_module.requests, "post", fake_post)
+
+    response = client.post(
+        "/api/script/partial",
+        json={"project_id": project_id, "target_slide": 2, "style": "격식체"},
+    )
+    assert response.status_code == 200
+    # 아직 대본이 없는 2번 슬라이드라도 원문이 프롬프트에 들어가야 한다.
+    assert "시장 규모와 성장률 도표" in sent["prompt"]
+    assert "대상 슬라이드 원문" in sent["prompt"]
+
+
+def test_script_job_reports_missing_slides(monkeypatch, db_session_factory):
+    """생성 실패한 슬라이드가 있으면 폴링 응답으로 프론트가 알 수 있어야 한다."""
+    project_id = _create_project(db_session_factory, [(1, "가"), (2, "나")])
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        prompt = json["messages"][-1]["content"][0]["text"]
+        content = "" if "Slide 2" in prompt else "정상 대본입니다."
+        return _FakeResponse({"result": {"message": {"content": content}}})
+
+    monkeypatch.setattr(main.full_generator, "use_fallback", False)
+    monkeypatch.setattr(full_gen_module.requests, "post", fake_post)
+
+    body = _generate_full_and_wait({"project_id": project_id, "presentation_time": 2, "style": "격식체"})
+    assert body["status"] == "completed"
+    assert body["data"]["missing_slide_numbers"] == ["2"]

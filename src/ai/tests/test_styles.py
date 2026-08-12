@@ -12,26 +12,34 @@ from clova.styles import STYLE_INSTRUCTIONS, audience_instruction, style_instruc
 
 
 def test_formal_style_forbids_casual_endings():
-    formal = STYLE_INSTRUCTIONS["격식체"]
+    formal = STYLE_INSTRUCTIONS["formal"]
     assert "하십시오체" in formal or "습니다" in formal
     for banned in ("이고요", "해요", "답니다"):
         assert banned in formal, f"금지 어미 '{banned}'가 지시에 명시돼야 한다"
 
 
 def test_casual_style_targets_casual_endings_and_avoids_stiff():
-    """어미 고정은 스타일별로 달라야 한다 — 편안한 말투는 해요체를 지향하고 딱딱한 문어체를 피한다."""
-    casual = STYLE_INSTRUCTIONS["편안한 말투"]
+    """어미 고정은 스타일별로 달라야 한다 — casual은 해요체를 지향하고 딱딱한 문어체를 피한다."""
+    casual = STYLE_INSTRUCTIONS["casual"]
     assert "해요" in casual and "네요" in casual
     assert "하십시오" in casual, "지나치게 격식 있는 어미로 새지 않도록 명시돼야 한다"
 
 
 def test_each_style_locks_different_endings():
     """두 스타일의 지시가 서로 달라야 의미가 있다(같은 문장을 재사용하면 안 됨)."""
-    assert STYLE_INSTRUCTIONS["격식체"] != STYLE_INSTRUCTIONS["편안한 말투"]
+    assert STYLE_INSTRUCTIONS["formal"] != STYLE_INSTRUCTIONS["casual"]
 
 
 def test_unknown_style_falls_back_to_formal():
-    assert style_instruction("존재하지-않는-스타일") == STYLE_INSTRUCTIONS["격식체"]
+    assert style_instruction("존재하지-않는-스타일") == STYLE_INSTRUCTIONS["formal"]
+
+
+def test_korean_aliases_still_work():
+    """스프링 연동(8/12)부터 공식 값은 formal/casual이지만, 기존 문서·프론트가 쓰던
+    한국어 값도 같은 지시로 이어져야 한다. 여기가 깨지면 한국어 값이 **조용히 formal로
+    폴백**해서, 편안한 말투를 고른 사용자가 격식체 대본을 받는다."""
+    assert style_instruction("격식체") == STYLE_INSTRUCTIONS["formal"]
+    assert style_instruction("편안한 말투") == STYLE_INSTRUCTIONS["casual"]
 
 
 class _FakeResponse:

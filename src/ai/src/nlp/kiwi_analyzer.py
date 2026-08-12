@@ -26,14 +26,26 @@ class KiwiAnalyzer:
         """
         텍스트에서 명사/고유명사/외국어 중 2글자 이상인 단어를 중복 없이 추출한다.
         (한 글자 단어 '것/수/데' 등은 발음 주의 대상으로 의미가 낮아 제외 — ETRI 로직과 동일)
+
+        ⚠️ **대본에 처음 나온 순서를 반드시 유지한다.** 예전엔 집합(set)으로 중복을 지우고
+        `list(set(...))`으로 돌려줬는데, 파이썬 문자열 해시는 프로세스마다 무작위라
+        (PYTHONHASHSEED) **같은 대본인데 실행할 때마다 순서가 달라졌다.** 호출자가
+        `MAX_DIFFICULT_WORDS`(40개)로 앞에서 자르기 때문에, 순서가 흔들리면 **잘려나가는
+        단어가 매번 바뀐다** — 실측(2026-08-09, 제로 대본): 후보 144개 중 40개만 남는데
+        연속 3회 실행에서 앞 8개가 전부 달랐고, 최종 목록도 16개 vs 20개로 갈렸다.
+        사용자 눈에는 "같은 대본을 다시 분석했더니 발음 주의 단어가 딴 게 나온다"로 보인다.
+
+        처음 나온 순서로 두면 결정적일 뿐 아니라, 잘릴 때 **발표 앞부분 단어가 남아서**
+        사용자가 먼저 마주치는 단어들이 목록에 들어간다.
         """
         if self.use_fallback or not text or not text.strip():
             return []
 
         try:
             tokens = self.kiwi.tokenize(text)
+            # dict는 삽입 순서를 보존한다 — 첫 등장 순서 유지 + 중복 제거를 한 번에.
             words = {
-                token.form
+                token.form: None
                 for token in tokens
                 if token.tag in self.TARGET_TAGS and len(token.form) > 1
             }

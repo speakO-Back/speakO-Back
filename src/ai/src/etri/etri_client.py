@@ -53,17 +53,22 @@ class EtriLanguageAnalyzer:
 
             result = response.json()
             
-            extracted_words = set()
+            # ⚠️ dict로 중복을 지운다 — set을 쓰면 안 된다.
+            # 파이썬 문자열 해시는 프로세스마다 무작위라(PYTHONHASHSEED) list(set(...))의 순서가
+            # 실행할 때마다 바뀐다. 호출자가 MAX_DIFFICULT_WORDS(40)로 앞에서 자르므로,
+            # 순서가 흔들리면 같은 대본인데 매번 다른 단어 목록이 나온다.
+            # (Kiwi 쪽에서 실제로 터진 결함 — nlp/kiwi_analyzer.py의 주석 참고)
+            extracted_words = {}
             sentences = result.get('return_object', {}).get('sentence', [])
-            
+
             for sentence in sentences:
                 for morp in sentence.get('morp', []):
                     # NNG(일반명사), NNP(고유명사), SL(외국어) 품사만 추출
                     if morp['type'] in ['NNG', 'NNP', 'SL']:
                         # 한 글자 단어는 제외 (예: '것', '수' 등)
                         if len(morp['lemma']) > 1:
-                            extracted_words.add(morp['lemma'])
-                            
+                            extracted_words.setdefault(morp['lemma'], None)
+
             return list(extracted_words)
             
         except Exception as e:

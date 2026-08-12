@@ -5,7 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from utils.usage_tracker import log_hcx_call
-from clova.toon_parser import parse_toon_slides
+from clova.hcx_request import post_with_retry
+from clova.toon_parser import clean_script_text, parse_toon_slides
 from clova.styles import (
     FIRST_SLIDE_INSTRUCTION,
     LAST_SLIDE_INSTRUCTION,
@@ -47,23 +48,89 @@ def _split_slide_blocks(ppt_text):
 
 
 def _clean_single_slide_script(text):
+    """한 장짜리 응답에서 대본 문장만 남긴다. 정리 규칙은 부분 재생성과 공유한다(clova/toon_parser.py)."""
+    return clean_script_text(text)
+
+
+# 원문이 이 글자 수 미만이면 "제목만 있고 내용은 없는 슬라이드"로 본다.
+# 디자인 이미지 한 장뿐인 슬라이드, 섹션 표지, 도표만 있는 슬라이드가 여기 해당한다.
+THIN_SOURCE_CHARS = int(os.getenv("THIN_SLIDE_SOURCE_CHARS", "30"))
+
+# "Slide 20:" 라벨과 "[발표자 가이드]" 같은 머리표는 근거 분량에 넣지 않는다.
+_SOURCE_LABELS = re.compile(r"^\s*Slide\s+\d+\s*:|\[[^\]]{1,30}\]")
+
+
+def _is_thin_source(block):
     """
-    한 장짜리 요청의 응답을 대본 문장만 남기고 정리한다.
-    평문으로 답하라고 했지만 모델이 습관적으로 TOON 껍데기나 "Slide 1:" 라벨을 붙이는 경우가 있다.
+    이 슬라이드에 대본의 근거가 될 원문이 사실상 없는가.
+
+    왜 필요한가: 원문이 "서비스 기술 스택" 한 줄뿐이면 모델은 빈칸을 그럴듯한 추측으로 채운다.
+    실측(2026-08-06): 텍스트가 0인 기술 스택 슬라이드에 React·Redux·Node.js·Express·MongoDB·
+    WebSocket을 통째로 지어냈다. 시스템 프롬프트에 "지어내지 마세요"를 넣어도 재발했다 —
+    모델 입장에서는 발표 대본을 써야 하는데 쓸 거리가 없으니 만들어내는 것이다.
+    그래서 **그런 슬라이드임을 감지해서 다른 지시를 준다**(무엇을 쓸지 대신 알려준다).
     """
-    if not text:
-        return ""
+    body = _SOURCE_LABELS.sub(" ", block or "")
+    return len(re.sub(r"\s+", "", body)) < THIN_SOURCE_CHARS
 
-    script = text.strip()
 
-    # 혹시 TOON으로 답했으면 벗겨낸다.
-    parsed = parse_toon_slides(script)
-    if parsed:
-        script = " ".join(item["script"] for item in parsed)
+# 근거가 없는 슬라이드에 주는 지시. "지어내지 마세요"만으로는 부족하고,
+# 대신 무엇을 쓰면 되는지를 알려줘야 모델이 빈칸을 추측으로 채우지 않는다.
+_THIN_SOURCE_INSTRUCTION = (
+    "이 슬라이드에는 제목/주제 한 줄 외에 참고할 내용이 없습니다. "
+    "구체적인 항목 — 기술·제품·회사 이름, 숫자, 사람 이름, 목록 항목 — 을 절대 지어내지 마세요. "
+    "대신 이 슬라이드에서 무엇을 다루는지 청중에게 안내하는 2~3문장만 쓰고, "
+    "세부 내용은 '보시는 바와 같이', '화면에 정리했습니다'처럼 슬라이드를 가리키는 표현으로 넘기세요. "
+    "짧아도 괜찮습니다. 분량을 채우려고 없는 내용을 만들어내면 안 됩니다."
+)
+_NORMAL_SOURCE_INSTRUCTION = (
+    "위 [PPT 텍스트]에 있는 내용만 근거로 쓰세요. 거기 없는 구체적 사실은 지어내지 마세요."
+)
 
-    script = re.sub(r"^\s*Slide\s*\d*\s*:\s*", "", script)
-    script = re.sub(r"\s+", " ", script).strip()
-    return script
+
+# 발표 중간 슬라이드에서 나오면 안 되는 마무리 인사. 프롬프트로 금지해도 모델이 종종 붙인다
+# (실측: 제로 PPT 재생성 8장 중 2장이 중간인데 "감사합니다"로 끝남). 지시에만 기대지 않고 코드로 지운다.
+_CLOSING_GREETING_PATTERN = re.compile(
+    r"(?:\s*(?:이상입니다|감사합니다|경청해\s*주셔서\s*감사합니다|들어주셔서\s*감사합니다|"
+    r"감사드립니다|고맙습니다)[.!]?\s*)+$"
+)
+
+
+def _strip_closing_greeting(script):
+    """중간 슬라이드 끝에 붙은 마무리 인사를 제거한다. 인사만 남으면(=지우면 빈 대본) 원문을 유지한다."""
+    if not script:
+        return script
+    stripped = _CLOSING_GREETING_PATTERN.sub("", script).strip()
+    return stripped if stripped else script
+
+
+# 발표자 이름이 자료에 없을 때 모델이 채워 넣는 자리표시자.
+# clova/styles.py의 FIRST_SLIDE_INSTRUCTION이 이미 "'OOO'나 '홍길동'을 쓰지 말라"고 못박고 있는데도
+# 모델이 그대로 어긴다(실측: 4개 발표 중 2개의 첫 장이 각각 "홍길동입니다", "발표자 OOO입니다").
+# 마무리 인사와 같은 이유로, 지시에만 기대지 않고 코드로 지운다.
+_PLACEHOLDER_NAME = r"(?:홍길동|길동이?|OOO+|ooo+|XXX+|xxx+|○+|◯+|△+|□+|\*{2,}|아무개|모모)"
+
+# "…을 맡은 홍길동입니다" → "…을 맡았습니다" 처럼, 이름만 빼고 문장은 살린다.
+_PLACEHOLDER_INTRO_PATTERNS = (
+    (re.compile(rf"(발표를?|진행을?)\s*(맡은|맡게 된|담당한)\s*{_PLACEHOLDER_NAME}\s*(?:입니다|이라고 합니다)"), r"\1 맡았습니다"),
+    (re.compile(rf"발표자\s*{_PLACEHOLDER_NAME}\s*(?:입니다|이라고 합니다)"), "발표를 맡았습니다"),
+    # 자기소개 문장이 통째로 자리표시자뿐이면 문장을 지운다("저는 OOO입니다.").
+    (re.compile(rf"\s*저(?:는|희는)?\s*{_PLACEHOLDER_NAME}\s*(?:입니다|이라고 합니다)[.!]?"), ""),
+    # 남은 형태("팀 OOO입니다")는 이름만 들어낸다.
+    (re.compile(rf"\s*{_PLACEHOLDER_NAME}(?=\s*(?:입니다|이라고 합니다))"), ""),
+)
+
+
+def _strip_placeholder_name(script):
+    """자료에 없는 발표자 이름을 모델이 자리표시자로 채운 경우, 이름을 빼고 문장을 살린다."""
+    if not script:
+        return script
+    cleaned = script
+    for pattern, replacement in _PLACEHOLDER_INTRO_PATTERNS:
+        cleaned = pattern.sub(replacement, cleaned)
+    # 문장을 통째로 지웠을 때 남는 이중 공백을 정리한다.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned if cleaned else script
 
 
 def _position_label(index, total):
@@ -128,12 +195,15 @@ class FullScriptGenerator:
         def build_one(item):
             index, (number, block) = item
             slides = self._request_one_slide(
-                number, block, _position_label(index, len(blocks)), per_slide_time, style, extra_requirement, audience, topic
+                number, block, _position_label(index, len(blocks)), per_slide_time, style, extra_requirement, audience, topic,
+                is_last=(index == len(blocks) - 1),
             )
             return number, slides
 
         all_slides = []
         missing = []
+        # 근거 없이 만든 슬라이드를 사용자에게 알려주기 위해 미리 표시해둔다(아래 반환값 주석 참고).
+        thin = [number for number, block in blocks if _is_thin_source(block)]
         workers = min(MAX_CONCURRENT_REQUESTS, len(blocks))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for number, slides in pool.map(build_one, enumerate(blocks)):
@@ -148,9 +218,19 @@ class FullScriptGenerator:
             return None
 
         all_slides.sort(key=lambda s: int(s["slide_number"]))
-        return {"slides": all_slides}
+        # 끝내 못 만든 슬라이드는 콘솔에만 찍고 넘어가면 프론트가 "왜 이 장만 비어 있지?"를 알 수 없다.
+        # 결과에 실어 보내서 화면에서 "이 슬라이드는 다시 생성해 주세요"를 안내할 수 있게 한다.
+        #
+        # thin_source_slide_numbers: 원문이 제목 한 줄뿐이라 **내용을 근거로 쓸 수 없었던** 슬라이드.
+        # 여기 대본은 슬라이드를 가리키는 일반적인 안내문이므로 발표자가 직접 채워야 한다.
+        # 조용히 그럴듯한 대본을 주면 발표자가 그대로 읽다가 사실이 아닌 말을 하게 된다.
+        return {
+            "slides": all_slides,
+            "missing_slide_numbers": missing,
+            "thin_source_slide_numbers": thin,
+        }
 
-    def _request_one_slide(self, slide_number, block, position, presentation_time, style, extra_requirement, audience="", topic=""):
+    def _request_one_slide(self, slide_number, block, position, presentation_time, style, extra_requirement, audience="", topic="", is_last=True):
         """
         한 장만 요청할 때는 **TOON 포맷을 쓰지 않는다.**
         응답 전체가 곧 이 슬라이드의 대본이므로 구분자가 필요 없고, 오히려 껍데기를 요구하면
@@ -159,13 +239,21 @@ class FullScriptGenerator:
 
         한 장이 실패하면 그 슬라이드는 영구 누락이므로 한 번 더 시도한다.
         """
+        # 근거가 될 원문이 없는 슬라이드에는 다른 지시를 준다 — 안 그러면 모델이 빈칸을 지어낸다.
+        evidence = _THIN_SOURCE_INSTRUCTION if _is_thin_source(block) else _NORMAL_SOURCE_INSTRUCTION
+
         for attempt in range(2):
             text = self._call_hcx(
                 self._SINGLE_SLIDE_PROMPT,
-                self._build_user_prompt(block, presentation_time, style, extra_requirement, position, audience, topic),
+                self._build_user_prompt(block, presentation_time, style, extra_requirement, position, audience, topic, evidence),
             )
             script = _clean_single_slide_script(text)
             if script:
+                # 마지막 장이 아니면 "감사합니다" 같은 마무리 인사를 지운다(프롬프트 금지를 모델이 자주 어김).
+                if not is_last:
+                    script = _strip_closing_greeting(script)
+                # 자료에 없는 발표자 이름("홍길동입니다")도 같은 이유로 코드에서 지운다.
+                script = _strip_placeholder_name(script)
                 return [{"slide_number": slide_number, "script": script}]
             if attempt == 0:
                 print(f"  ↻ 슬라이드 {slide_number} 응답이 비어 한 번 더 시도합니다.")
@@ -179,7 +267,9 @@ class FullScriptGenerator:
         주어진 슬라이드 **한 장**에 대해, 발표자가 그 슬라이드를 띄워놓고 말할 대본을 작성하세요.
 
         [작성 가이드라인]
-        1. 슬라이드에 적힌 내용만 다루세요. 없는 내용을 지어내지 마세요.
+        1. 슬라이드에 적힌 내용만 다루세요. 자료에 없는 **구체적 사실**(기술·제품·회사 이름, 숫자,
+           사람 이름)은 절대 지어내지 말고, 근거가 없으면 그 부분은 일반적인 표현으로 넘기세요.
+           자료에 근거가 없으면 '저희가 개발한'처럼 만든 주체를 단정하지도 마세요.
         2. 발표자가 청중 앞에서 실제로 말하듯 자연스럽게 작성하세요. 문어체(보고서 문장)는 피하되,
            말투(문장 끝맺음)는 아래 [반드시 지킬 것 — 말투]를 그대로 따르세요.
         3. [추가 요구사항]이 주어지면 반드시 반영하세요.
@@ -208,7 +298,7 @@ class FullScriptGenerator:
          2,다음으로 넘어가겠습니다. 시장 규모를 살펴보면...
         """
 
-    def _build_user_prompt(self, ppt_text, presentation_time, style, extra_requirement, position, audience="", topic=""):
+    def _build_user_prompt(self, ppt_text, presentation_time, style, extra_requirement, position, audience="", topic="", evidence=""):
         # [위치]와 [말투] 지시는 프롬프트 맨 뒤에 둔다. 중간에 끼워 넣었더니 모델이 무시하고
         # 장마다 인사말로 시작하거나(19장 중 16장) 해요체로 흘러내렸다.
         # "발표 스타일: 격식체"처럼 단어만 주면 안 되고, 어미까지 문장으로 못박아야 한다.
@@ -225,6 +315,9 @@ class FullScriptGenerator:
 
         [PPT 텍스트]
         {ppt_text}
+
+        [반드시 지킬 것 — 근거]
+        {evidence or _NORMAL_SOURCE_INSTRUCTION}
 
         [반드시 지킬 것 — 위치]
         {position or '전체 발표 대본을 작성하세요.'}
@@ -267,11 +360,9 @@ class FullScriptGenerator:
         }
 
         try:
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-            if response.status_code >= 400:
-                # 상태코드만으로는 원인을 알 수 없다. 응답 본문에 진짜 이유가 들어있다.
-                raise RuntimeError(f"HTTP {response.status_code} — {response.text[:300]}")
-
+            # 429(분당 한도)는 슬라이드마다 호출하는 이 구조에서 정상적으로 발생한다.
+            # 재시도 없이 던지면 그 슬라이드가 영구 누락된다(clova/hcx_request.py 참고).
+            response = post_with_retry(self.endpoint, headers, payload, REQUEST_TIMEOUT_SECONDS, label="full")
             result = response.json()
 
             usage = result.get('result', {}).get('usage', {})
@@ -335,7 +426,8 @@ class ScriptRefiner:
             if not refined or [number for number, _ in _split_slide_blocks(refined)] != expected:
                 print(f"  ⚠️ 슬라이드 {chunk[0][0]}~{chunk[-1][0]} 고도화 결과가 원본과 안 맞아 초안을 유지합니다.")
                 refined = chunk_text
-            return refined
+            # 다듬는 과정에서 발표자 이름을 자리표시자로 "보강"해 넣는 경우가 있어 여기서도 한 번 더 지운다.
+            return _strip_placeholder_name(refined)
 
         workers = min(MAX_CONCURRENT_REQUESTS, len(chunks))
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -389,9 +481,7 @@ class ScriptRefiner:
         print("🚀 HyperCLOVA X에 대본 자연스러움 고도화(리뷰)를 요청합니다...")
 
         try:
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-            response.raise_for_status()
-
+            response = post_with_retry(self.endpoint, headers, payload, REQUEST_TIMEOUT_SECONDS, label="refine")
             result = response.json()
             refined_text = result["result"]["message"]["content"]
 

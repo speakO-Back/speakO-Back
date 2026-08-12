@@ -237,3 +237,153 @@ def test_non_slide_input_is_sent_as_is(monkeypatch):
 
     assert len(sent) == 1
     assert result["slides"][0]["script"] == "브리프 기반 대본"
+
+
+# ── 중간 슬라이드의 마무리 인사 제거 ──────────────────────────────────────────
+# 프롬프트에 "마무리 인사(감사합니다 등)를 넣지 마세요"라고 이미 금지했는데도 모델이 자주 어긴다
+# (실측: 제로 PPT 8장 재생성에서 중간 슬라이드 2장이 "감사합니다"로 끝남). 코드로 확실히 지운다.
+
+def test_closing_greeting_is_stripped_from_middle_slides(monkeypatch):
+    def responder(user_prompt):
+        return "이 슬라이드의 내용을 설명드리겠습니다. 감사합니다."
+
+    _stub_hcx(monkeypatch, responder)
+    result = _generator().generate_full_script(_ppt_text(3), 3, "격식체")
+
+    scripts = {s["slide_number"]: s["script"] for s in result["slides"]}
+    assert scripts["1"] == "이 슬라이드의 내용을 설명드리겠습니다."
+    assert scripts["2"] == "이 슬라이드의 내용을 설명드리겠습니다."
+    # 마지막 장은 마무리 인사가 정상이므로 그대로 둔다.
+    assert scripts["3"] == "이 슬라이드의 내용을 설명드리겠습니다. 감사합니다."
+
+
+def test_various_closing_greetings_are_stripped(monkeypatch):
+    from clova.full_generation.generator import _strip_closing_greeting
+
+    assert _strip_closing_greeting("본문입니다. 경청해 주셔서 감사합니다.") == "본문입니다."
+    assert _strip_closing_greeting("본문입니다. 이상입니다.") == "본문입니다."
+    assert _strip_closing_greeting("본문입니다. 감사합니다. 이상입니다.") == "본문입니다."
+    # 인사가 없으면 그대로 둔다.
+    assert _strip_closing_greeting("본문입니다.") == "본문입니다."
+    # 문장 중간의 '감사'는 건드리지 않는다.
+    assert _strip_closing_greeting("감사 인사를 전하는 문화를 살펴봅니다.") == "감사 인사를 전하는 문화를 살펴봅니다."
+
+
+def test_greeting_only_script_is_kept(monkeypatch):
+    """지우면 빈 대본이 되는 경우엔 원문을 유지한다(내용 유실 방지)."""
+    from clova.full_generation.generator import _strip_closing_greeting
+
+    assert _strip_closing_greeting("감사합니다.") == "감사합니다."
+
+
+def test_missing_slides_are_reported_in_result(monkeypatch):
+    """끝내 못 만든 슬라이드는 콘솔에만 찍지 말고 결과에 실어야 한다.
+    안 그러면 프론트가 '왜 이 장만 비어 있지?'를 알 수 없다."""
+
+    def responder(user_prompt):
+        # 2번 슬라이드만 계속 빈 응답 -> 재시도까지 실패
+        return "" if "2번 슬라이드 내용" in user_prompt else "정상 대본입니다."
+
+    _stub_hcx(monkeypatch, responder)
+    result = _generator().generate_full_script(_ppt_text(3), 3, "격식체")
+
+    assert [s["slide_number"] for s in result["slides"]] == ["1", "3"]
+    assert result["missing_slide_numbers"] == ["2"]
+
+
+def test_no_missing_slides_reports_empty_list(monkeypatch):
+    _stub_hcx(monkeypatch, lambda user_prompt: "정상 대본입니다.")
+    result = _generator().generate_full_script(_ppt_text(2), 2, "격식체")
+    assert result["missing_slide_numbers"] == []
+
+
+# ------------------------------------------------- 근거 없는 내용 지어내기 방지
+
+def test_placeholder_presenter_name_is_stripped():
+    """자료에 발표자 이름이 없으면 모델이 '홍길동'/'OOO'로 채운다(실측: 4개 발표 중 2개의 첫 장).
+    프롬프트로 이미 금지했는데도 어기므로 코드에서 지운다."""
+    from clova.full_generation.generator import _strip_placeholder_name
+
+    assert _strip_placeholder_name(
+        "안녕하세요. 이번 발표를 맡은 홍길동입니다."
+    ) == "안녕하세요. 이번 발표를 맡았습니다."
+    assert _strip_placeholder_name(
+        "안녕하세요. 발표자 OOO입니다."
+    ) == "안녕하세요. 발표를 맡았습니다."
+    assert _strip_placeholder_name(
+        "안녕하세요. 저는 ○○○입니다. 발표를 시작하겠습니다."
+    ) == "안녕하세요. 발표를 시작하겠습니다."
+
+
+def test_real_presenter_name_is_kept():
+    """진짜 이름까지 지우면 자료에 있는 정보를 잃는다."""
+    from clova.full_generation.generator import _strip_placeholder_name
+
+    original = "안녕하세요. 이번 발표를 맡은 김진순입니다."
+    assert _strip_placeholder_name(original) == original
+
+
+def test_placeholder_stripping_does_not_empty_the_script():
+    from clova.full_generation.generator import _strip_placeholder_name
+
+    assert _strip_placeholder_name("저는 홍길동입니다.") == "저는 홍길동입니다."
+
+
+def test_placeholder_name_is_stripped_in_generated_script(monkeypatch):
+    """단위 함수만이 아니라 실제 생성 경로에서도 걸러져야 한다."""
+    # 슬라이드가 2장 이상이어야 장별 생성 경로(_request_one_slide)를 탄다.
+    _stub_hcx(monkeypatch, lambda user_prompt: "안녕하세요. 이번 발표를 맡은 홍길동입니다.")
+    result = _generator().generate_full_script(_ppt_text(2), 2, "격식체")
+
+    assert "홍길동" not in result["slides"][0]["script"]
+
+
+def test_prompt_forbids_inventing_concrete_facts(monkeypatch):
+    """가이드라인이 짧은 슬라이드(예: '서비스 기술 스택')에서 모델이 스택을 통째로 지어냈다.
+    구체적 사실을 지어내지 말라는 지시가 시스템 프롬프트에 살아 있어야 한다."""
+    from clova.full_generation.generator import FullScriptGenerator
+
+    prompt = FullScriptGenerator._SINGLE_SLIDE_PROMPT
+    assert "지어내지" in prompt
+    assert "저희가 개발한" in prompt, "만든 주체를 단정하지 말라는 지시가 없습니다"
+
+
+def test_thin_source_slide_gets_a_different_instruction(monkeypatch):
+    """원문이 제목 한 줄뿐이면 모델은 빈칸을 추측으로 채운다.
+    실측(2026-08-06): 텍스트가 0인 '서비스 기술 스택' 장에 React·Node.js·MongoDB를 통째로 지어냈다.
+    '지어내지 마세요'만으로는 재발했으므로, 그런 장임을 감지해 무엇을 쓸지 대신 알려준다."""
+    from clova.full_generation.generator import _THIN_SOURCE_INSTRUCTION
+
+    seen = []
+    _stub_hcx(monkeypatch, lambda user_prompt: seen.append(user_prompt) or "대본입니다.")
+    _generator().generate_full_script(
+        "Slide 1: 서비스 기술 스택\nSlide 2: " + "구체적인 내용이 충분히 들어 있는 슬라이드입니다. " * 3,
+        2, "격식체",
+    )
+
+    thin_prompt = next(p for p in seen if "서비스 기술 스택" in p)
+    rich_prompt = next(p for p in seen if "구체적인 내용이 충분히" in p)
+    assert _THIN_SOURCE_INSTRUCTION in thin_prompt
+    assert _THIN_SOURCE_INSTRUCTION not in rich_prompt, "내용이 있는 장까지 일반 안내문으로 만들면 대본이 부실해진다"
+
+
+def test_thin_source_slides_are_reported(monkeypatch):
+    """근거 없이 만든 장을 조용히 넘기면 발표자가 그대로 읽다가 사실이 아닌 말을 하게 된다."""
+    _stub_hcx(monkeypatch, lambda user_prompt: "대본입니다.")
+    result = _generator().generate_full_script(
+        "Slide 1: 목차\nSlide 2: " + "실제 내용이 충분히 들어 있는 슬라이드입니다. " * 3,
+        2, "격식체",
+    )
+
+    assert result["thin_source_slide_numbers"] == ["1"]
+
+
+def test_thin_source_detection_ignores_labels():
+    """'Slide 20:'이나 '[발표자 가이드]' 같은 머리표는 근거가 아니다."""
+    from clova.full_generation.generator import _is_thin_source
+
+    assert _is_thin_source("Slide 20: [발표자 가이드] 서비스 기술 스택")
+    assert not _is_thin_source(
+        "Slide 20: [발표자 가이드] 서비스 기술 스택 / [슬라이드에서 읽힌 글자] "
+        "프론트엔드 React 백엔드 Spring Boot 데이터베이스 PostgreSQL 배포 AWS EC2"
+    )

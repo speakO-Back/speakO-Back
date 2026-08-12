@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# 이 줄을 지우지 말 것. pip은 BOM/인코딩 선언이 없으면 파일을 로케일 인코딩으로 읽는데,
+# 한국어 Windows(cp949)에서는 아래 한글 주석 때문에 `pip install -r`이 UnicodeDecodeError로 죽는다.
 fastapi==0.138.2
 uvicorn[standard]==0.49.0
 python-dotenv==1.2.2
@@ -13,3 +16,6 @@ kiwipiepy==0.23.2
 # HCX 비전이 못 받는 이미지 포맷(EMF/WMF/TIFF 등)을 PNG로 변환할 때 사용.
 # python-pptx가 의존성으로 끌고 오지만, 직접 쓰므로 명시한다.
 Pillow==12.3.0
+# g2pkk가 의존하는 eunjeon/mecab 계열이 pkg_resources를 import하는데, setuptools 81부터
+# 제거 예정이라 없으면 G2P 로드가 실패한다. (실패하면 발음기호가 철자와 같아져 발음 코칭이 죽는다)
+setuptools<82

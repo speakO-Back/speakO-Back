@@ -63,3 +63,36 @@ def test_valid_slide_numbers_rejects_body_numbers():
 def test_empty_and_unparsable_input():
     assert parse_toon_slides("") == []
     assert parse_toon_slides("죄송합니다. 요청을 처리할 수 없습니다.") == []
+
+
+# ── 한 장짜리 대본 정리 (clean_script_text) ──────────────────────────────────
+# 실측: 부분 재생성에서 모델이 TOON 헤더만 붙이고 본문은 평문으로 써서
+# ("slides[2]{slide_number,script}:" + 줄바꿈 + 대본), 파서가 빈 결과를 내고
+# 내용이 멀쩡한 대본이 502로 폐기됐다.
+
+from clova.toon_parser import clean_script_text
+
+
+def test_clean_script_keeps_body_when_only_header_present():
+    raw = "slides[2]{slide_number,script}: \n자 그럼 이제 발표를 시작해볼게요! 집중해서 들어보세요."
+    assert clean_script_text(raw) == "자 그럼 이제 발표를 시작해볼게요! 집중해서 들어보세요."
+
+
+def test_clean_script_uses_toon_row_when_present():
+    raw = "slides[1]{slide_number,script}:\n 3,시장 규모를 살펴보겠습니다."
+    assert clean_script_text(raw) == "시장 규모를 살펴보겠습니다."
+
+
+def test_clean_script_strips_slide_label():
+    assert clean_script_text("Slide 3: 다음 내용입니다.") == "다음 내용입니다."
+
+
+def test_clean_script_strips_markdown_emphasis():
+    """소리 내어 읽는 대본에 마크다운 기호가 남으면 안 된다."""
+    assert clean_script_text("첫 번째 주제인 '**발표**'에 대해 말씀드립니다.") == "첫 번째 주제인 '발표'에 대해 말씀드립니다."
+
+
+def test_clean_script_collapses_whitespace_and_handles_empty():
+    assert clean_script_text("  여러   줄\n\n대본입니다.  ") == "여러 줄 대본입니다."
+    assert clean_script_text("") == ""
+    assert clean_script_text(None) == ""

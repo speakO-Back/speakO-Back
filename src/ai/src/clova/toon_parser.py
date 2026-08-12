@@ -43,3 +43,39 @@ def parse_toon_slides(toon_text: str, valid_slide_numbers=None) -> list:
         slides.append({"slide_number": num.strip(), "script": script})
 
     return slides
+
+
+# 대본 한 장을 평문으로 받았을 때 남는 껍데기들:
+#   slides[2]{slide_number,script}:   ← 포맷 헤더만 남고 정작 "번호,"가 없는 경우(실측)
+#   Slide 3:                          ← 라벨
+#   **강조**                          ← 마크다운. 소리 내어 읽는 대본에는 들어가면 안 된다.
+_HEADER_ONLY_PATTERN = re.compile(r"^\s*slides\s*(?:\[\s*\d+\s*\])?\s*\{[^}]*\}\s*:?\s*", re.IGNORECASE)
+_LABEL_PATTERN = re.compile(r"^\s*Slide\s*\d*\s*:\s*", re.IGNORECASE)
+_MARKDOWN_EMPHASIS = re.compile(r"(\*\*|__|\*|`)")
+
+
+def clean_script_text(text: str) -> str:
+    """
+    모델이 돌려준 '한 장짜리 대본'에서 대본 문장만 남긴다.
+
+    평문으로 답하라고 해도 모델은 습관적으로 TOON 껍데기나 "Slide 1:" 라벨, 마크다운 강조를
+    붙인다. 이걸 실패로 처리하면 내용이 멀쩡한 대본이 통째로 버려진다(실측: 부분 재생성이
+    헤더만 붙었다는 이유로 502로 폐기됐다).
+    """
+    if not text:
+        return ""
+
+    script = text.strip()
+
+    # TOON 행("번호,내용")이 실제로 있으면 그걸 우선 사용한다.
+    parsed = parse_toon_slides(script)
+    if parsed:
+        script = " ".join(item["script"] for item in parsed)
+    else:
+        # 헤더만 붙고 본문은 평문인 경우 — 헤더만 걷어내고 본문은 그대로 살린다.
+        script = _HEADER_ONLY_PATTERN.sub("", script)
+
+    script = _LABEL_PATTERN.sub("", script)
+    script = _MARKDOWN_EMPHASIS.sub("", script)
+    script = re.sub(r"\s+", " ", script).strip()
+    return script

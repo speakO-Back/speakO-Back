@@ -19,6 +19,16 @@ def _isolate_usage_log(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """레이트 리밋은 프로세스 전역 카운터라, 리셋하지 않으면 앞 테스트의 호출이 뒤 테스트를 429로 막는다.
+    (테스트는 전부 같은 클라이언트 주소 'testclient'로 잡힌다)"""
+    from utils import rate_limit
+    rate_limit.limiter.reset()
+    yield
+    rate_limit.limiter.reset()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_stdict(monkeypatch):
     """
     로컬 .env에 실제 STDICT_API_KEY가 있으면 /api/analysis/words 테스트가 표준국어대사전 API를
@@ -27,6 +37,17 @@ def _isolate_stdict(monkeypatch):
     """
     import main
     monkeypatch.setattr(main.stdict_client, "use_fallback", True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tts_cache(monkeypatch, tmp_path):
+    """TTS 캐시가 실제 data/tts_cache에 파일을 남기지 않도록 테스트마다 격리한다.
+
+    격리하지 않으면 (1) 테스트가 개발자 머신에 캐시 파일을 쌓고 (2) 앞 테스트가 채워둔 캐시
+    때문에 뒤 테스트가 합성 호출을 건너뛰어, "합성이 불렸는가"를 보는 검증이 조용히 통과한다.
+    """
+    from tts import tts_cache
+    monkeypatch.setattr(tts_cache, "CACHE_DIR", str(tmp_path / "tts_cache"))
 
 
 @pytest.fixture(autouse=True)
@@ -61,11 +82,14 @@ def db_session_factory():
     # 테스트에서는 (1) 그 자체 세션을 같은 인메모리 DB로 향하게 하고,
     # (2) 스레드 대신 그 자리에서 즉시 실행(_SyncExecutor)해서 폴링 없이 결정적으로 끝나게 한다.
     # 이렇게 해도 엔드포인트의 실제 코드 경로(job 등록→실행→완료, 상태 조회)는 그대로 검증된다.
+    # job_store도 자체 세션으로 DB에 상태를 쓰므로(메모리 dict가 아님) 같은 인메모리 DB를 보게 한다.
     from utils import job_store
     prev_job_factory = main.job_session_factory
     prev_job_executor = main.job_executor
+    prev_store_factory = job_store.session_factory
     main.job_session_factory = TestSessionLocal
     main.job_executor = _SyncExecutor()
+    job_store.session_factory = TestSessionLocal
     job_store._reset_for_test()
 
     yield TestSessionLocal
@@ -73,6 +97,7 @@ def db_session_factory():
     main.job_session_factory = prev_job_factory
     main.job_executor = prev_job_executor
     job_store._reset_for_test()
+    job_store.session_factory = prev_store_factory
     main.app.dependency_overrides.clear()
     Base.metadata.drop_all(bind=engine)
 

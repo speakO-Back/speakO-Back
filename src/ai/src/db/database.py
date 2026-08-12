@@ -36,3 +36,38 @@ def get_db():
 def init_db():
     from db import models  # noqa: F401 (모델을 import해야 create_all이 테이블을 인식함)
     Base.metadata.create_all(bind=engine)
+    _add_missing_columns()
+
+
+# create_all은 "없는 테이블"만 만들고, 이미 있는 테이블에 컬럼이 추가돼도 손대지 않는다.
+# 그래서 모델에 컬럼을 새로 넣으면 기존 DB 파일에서는 그 컬럼이 없어 조회가 깨진다.
+# 마이그레이션 도구(alembic)를 붙일 규모는 아니라, 빠진 컬럼만 ALTER로 채우는 최소 장치를 둔다.
+_EXPECTED_COLUMNS = {
+    "pronunciation_evaluations": {
+        "feedback": "JSON", "reference_text": "TEXT", "recognized_text": "TEXT",
+        "slide_number": "INTEGER",
+    },
+    "difficult_words": {
+        "description": "TEXT",
+    },
+    "script_jobs": {
+        "step": "INTEGER",
+    },
+}
+
+
+def _add_missing_columns():
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    with engine.begin() as connection:
+        for table, columns in _EXPECTED_COLUMNS.items():
+            if table not in existing_tables:
+                continue
+            present = {column["name"] for column in inspector.get_columns(table)}
+            for name, sql_type in columns.items():
+                if name not in present:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"))
+                    print(f"🛠️  DB 마이그레이션: {table}.{name} 컬럼을 추가했습니다.")
