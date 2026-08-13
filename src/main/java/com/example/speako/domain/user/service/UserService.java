@@ -67,7 +67,82 @@ public class UserService {
             return UserResponseDTO.LoginResultDTO.builder()
                     .userId(user.getUserId())
                     .email(user.getEmail())
+                    .name(user.getName())
                     .accessToken(accessToken)
                     .build();
         }
+
+        //이름 수정
+        // 이름 수정
+        @Transactional
+        public void updateName(Long userId, UserRequestDTO.UpdateNameDTO request) { // 👈 파라미터 Long userId로 변경
+            User user = userRepository.findById(userId) // 👈 findByEmail 대신 findById 사용!
+                    .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+            // 닉네임 중복 검증
+            if (userRepository.existsByName(request.getName())) {
+                throw new IllegalArgumentException("이미 사용 중인 닉네임입니다.");
+            }
+
+            user.updateName(request.getName());
+        }
+
+        //이메일 변경
+        // 이메일 변경
+        @Transactional
+        public void updateEmail(Long userId, UserRequestDTO.UpdateEmailDTO request) { // 👈 파라미터 Long userId로 변경
+            User user = userRepository.findById(userId) // 👈 findByEmail 대신 findById 사용!
+                    .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+            // 현재 비밀번호 검증
+            if (!passwordEncoder.matches(request.getCurrentPassword(), user.getPassword())) {
+                throw new IllegalArgumentException("현재 비밀번호가 일치하지 않습니다.");
+            }
+
+            // 새 이메일이 기존 이메일과 다를 때만 중복 검증 수행
+            if (!user.getEmail().equals(request.getNewEmail())) {
+                if (userRepository.findByEmail(request.getNewEmail()).isPresent()) {
+                    throw new IllegalArgumentException("이미 사용 중인 이메일입니다.");
+                }
+            }
+
+            user.updateEmail(request.getNewEmail());
+        }
+    //비밀번호 변경
+    @Transactional
+    public void updatePassword(Long userId, UserRequestDTO.UpdatePasswordDTO request) {
+        User user = userRepository.findById(userId) // 👈 findByEmail 대신 findById 사용!
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+        if (!passwordEncoder.matches(request.getCurrentPassword(), user.getPassword())) {
+            throw new IllegalArgumentException("현재 비밀번호가 일치하지 않습니다.");
+        }
+
+        if (!request.getNewPassword().equals(request.getNewPasswordCheck())) {
+            throw new IllegalArgumentException("새로 입력한 비밀번호와 확인이 일치하지 않습니다.");
+        }
+
+        String encodedNewPassword = passwordEncoder.encode(request.getNewPassword());
+        user.updatePassword(encodedNewPassword);
     }
+
+    // 회원 탈퇴 (userId 기반)
+    @Transactional
+    public void withdraw(Long userId, String password) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+        if (!passwordEncoder.matches(password, user.getPassword())) {
+            throw new IllegalArgumentException("비밀번호가 일치하지 않습니다.");
+        }
+
+        userRepository.delete(user);
+    }
+
+    // 로그아웃 (userId 기반)
+    @Transactional
+    public void logout(Long userId) {
+        // JWT Stateless 환경에서는 클라이언트 토큰 삭제 처리
+    }
+}
+

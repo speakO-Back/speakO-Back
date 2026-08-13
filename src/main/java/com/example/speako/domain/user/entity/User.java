@@ -61,4 +61,15 @@ public class User {
     public enum Provider {
         local, kakao, google
     }
+    public void updateName(String name) {
+        this.name = name;
+    }
+
+    public void updateEmail(String email) {
+        this.email = email;
+    }
+
+    public void updatePassword(String password) {
+        this.password = password;
+    }
 }

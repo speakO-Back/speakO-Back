@@ -13,7 +13,6 @@ import java.util.Date;
 @Component
 public class JwtTokenProvider {
 
-    // 테스트용 임시 Secret Key (실무에서는 application.yml에 두고 가져와야 안전합니다)
     private final String secretKey = "yourSpeakoSecretKeyTokenSecretKeyPlaceHereVeryLongLength";
     private final long tokenValidityInMilliseconds = 1000L * 60 * 60 * 24; // 2시간 유지
 
@@ -22,7 +21,6 @@ public class JwtTokenProvider {
         return Keys.hmacShaKeyFor(keyBytes);
     }
 
-    // ⭐️ 영환님 서비스에서 호출할 바로 그 메서드입니다!
     public String createAccessToken(Long userId, String email) {
         Claims claims = Jwts.claims().setSubject(email);
         claims.put("userId", userId);
@@ -36,5 +34,32 @@ public class JwtTokenProvider {
                 .setExpiration(validity)
                 .signWith(getSigningKey(), SignatureAlgorithm.HS256)
                 .compact();
+    }
+    // 토큰 유효성 검증
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    public Long getUserId(String token) {
+        Claims claims = Jwts.parserBuilder()
+                .setSigningKey(getSigningKey())
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
+
+        return claims.get("userId", Long.class);
+    }
+    // 토큰에서 이메일(Subject) 추출
+    public String getEmail(String token) {
+        Claims claims = Jwts.parserBuilder()
+                .setSigningKey(getSigningKey())
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
+        return claims.getSubject();
     }
 }

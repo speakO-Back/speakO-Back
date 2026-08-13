@@ -13,3 +13,29 @@ spring:
       hibernate:
         format_sql: true
         default_batch_fetch_size: 100
+
+  cloud:
+    aws:
+      credentials:
+        access-key: ${AWS_ACCESS_KEY}
+        secret-key: ${AWS_SECRET_KEY}
+      region:
+        static: ap-northeast-2
+      s3:
+        bucket: speako-storage-2026
+      stack:
+        auto: false
+
+
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 25MB
+      max-request-size: 30MB
+      file-size-threshold: 30MB
+
+logging:
+  level:
+    org.springframework.web: DEBUG
+    org.springframework.web.multipart: DEBUG
+    org.springframework.http.converter: DEBUG
