@@ -44,7 +44,15 @@ public class JwtTokenProvider {
             return false;
         }
     }
+    public Long getUserId(String token) {
+        Claims claims = Jwts.parserBuilder()
+                .setSigningKey(getSigningKey())
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
 
+        return claims.get("userId", Long.class);
+    }
     // 토큰에서 이메일(Subject) 추출
     public String getEmail(String token) {
         Claims claims = Jwts.parserBuilder()

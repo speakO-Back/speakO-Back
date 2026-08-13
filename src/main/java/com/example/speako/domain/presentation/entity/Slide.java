@@ -1,14 +1,17 @@
 package com.example.speako.domain.presentation.entity;
 
+import com.example.speako.domain.script.entity.Script;
 import jakarta.persistence.*;
-import lombok.AccessLevel;
-import lombok.Builder;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
+import lombok.*;
+
+import java.util.ArrayList;
+import java.util.List;
 
 @Entity
 @Table(name = "slides")
 @Getter
+@Builder // ✨ 클래스 레벨에 붙여야 @Builder.Default가 유의미하게 동작합니다.
+@AllArgsConstructor // @Builder와 함께 사용하기 위해 필요
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
 public class Slide {
 
@@ -33,12 +36,7 @@ public class Slide {
     @Column(name = "thumbnail_url", length = 2083)
     private String thumbnailUrl;
 
-    @Builder
-    public Slide(Presentation presentation, int slideOrder, String slideTitle, String rawText, String thumbnailUrl) {
-        this.presentation = presentation;
-        this.slideOrder = slideOrder;
-        this.slideTitle = slideTitle;
-        this.rawText = rawText;
-        this.thumbnailUrl = thumbnailUrl;
-    }
+    @Builder.Default
+    @OneToMany(mappedBy = "slide", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<Script> scripts = new ArrayList<>();
 }

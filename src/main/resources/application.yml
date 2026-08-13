@@ -26,6 +26,14 @@ spring:
       stack:
         auto: false
 
+
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 25MB
+      max-request-size: 30MB
+      file-size-threshold: 30MB
+
 logging:
   level:
     org.springframework.web: DEBUG

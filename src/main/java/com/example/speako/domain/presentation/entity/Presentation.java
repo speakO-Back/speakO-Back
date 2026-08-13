@@ -40,6 +40,10 @@ public class Presentation {
     @Column(name = "slide_count", nullable = false)
     private int slideCount;
 
+    // ✨ AI 서버 프로젝트 번호 필드 추가
+    @Column(name = "ai_project_id")
+    private Long aiProjectId;
+
     @Column(name = "topic", nullable = false)
     private String topic;
 
@@ -72,16 +76,32 @@ public class Presentation {
     }
 
     @Builder
-    public Presentation(User user, String fileName, FileType fileType, float fileSize, int slideCount, String topic, int duration, Tone tone, String guideline, String fileUrl) {
+    public Presentation(User user, String fileName, FileType fileType, float fileSize,
+                        int slideCount, Long aiProjectId, String topic, int duration,
+                        Tone tone, String guideline, String fileUrl) {
         this.user = user;
         this.fileName = fileName;
         this.fileType = fileType;
         this.fileSize = fileSize;
         this.slideCount = slideCount;
+        this.aiProjectId = aiProjectId;
         this.topic = topic;
         this.duration = duration;
         this.tone = tone != null ? tone : Tone.formal;
         this.guideline = guideline;
         this.fileUrl = fileUrl;
+    }
+
+    // ✨ 전체 재생성 시 변경된 설정값을 반영하기 위한 update 메서드들 추가
+    public void updateDuration(int duration) {
+        this.duration = duration;
+    }
+
+    public void updateTone(Tone tone) {
+        this.tone = tone;
+    }
+
+    public void updateGuideline(String guideline) {
+        this.guideline = guideline;
     }
 }

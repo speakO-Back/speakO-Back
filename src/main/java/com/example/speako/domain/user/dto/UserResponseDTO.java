@@ -24,6 +24,7 @@ public class UserResponseDTO {
     public static class LoginResultDTO {
         private Long userId;
         private String email;
+        private String name;
         private String accessToken;
     }
 }
