@@ -324,7 +324,7 @@ public class PresentationService {
                 .build();
     }
 
-    /** 🔄 전체 대본 재생성 (유저 수정 대본 및 설정값 반영) */
+    /** 전체 대본 재생성 (유저 수정 대본 및 설정값 반영) */
     @Transactional
     public PresentationResponseDTO.DetailDTO regenerateAll(Long presentationId, Integer duration, String tone, String extraRequirement, String currentScript) {
         Presentation presentation = presentationRepository.findById(presentationId)
@@ -339,6 +339,7 @@ public class PresentationService {
             scriptRepository.deleteBySlide(s);
         }
         slideRepository.deleteAll(old);
+        slideRepository.flush();
 
         if (duration != null) presentation.updateDuration(duration);
         if (tone != null && !tone.isBlank()) presentation.updateTone(Presentation.Tone.valueOf(tone));
@@ -346,11 +347,11 @@ public class PresentationService {
 
         // TODO: 만약 AI 서버 전체 재생성 API 규격에 currentScript를 전달해야 한다면 아래 통신 로직에 추가 가능
         callPythonAiServerForScript(presentation, presentation.getTopic(), presentation.getDuration(), presentation.getTone().name(), presentation.getGuideline());
-
+        scriptRepository.flush();
         return getPresentationDetails(presentationId);
     }
 
-    /** 🔄 슬라이드 하나만 부분 재생성 (유저가 수정한 기존 대본 반영) */
+    /** 슬라이드 하나만 부분 재생성 (유저가 수정한 기존 대본 반영) */
     @Transactional
     public PresentationResponseDTO.DetailDTO regenerateOne(Long presentationId, Long scriptId, String tone, String extraRequirement, String currentScript) {
         Script script = scriptRepository.findWithSlideAndPresentation(scriptId)
@@ -380,7 +381,7 @@ public class PresentationService {
         body.put("style", (tone != null && !tone.isBlank()) ? tone : presentation.getTone().name());
         body.put("extra_requirement", (extraRequirement != null && !extraRequirement.isBlank()) ? extraRequirement : presentation.getGuideline());
 
-        // 👈 프론트엔드가 보내준 수정한 대본이 있다면 AI 서버로 함께 전달
+        //  프론트엔드가 보내준 수정한 대본이 있다면 AI 서버로 함께 전달
         if (currentScript != null && !currentScript.isBlank()) {
             body.put("current_script", currentScript);
         } else {
@@ -405,5 +406,49 @@ public class PresentationService {
         scriptRepository.save(script);
 
         return getPresentationDetails(presentationId);
+    }
+    //전체 대본 생성
+    @Transactional(readOnly = true)
+    public PresentationResponseDTO.FullScriptViewDTO getFullScriptForRecording(Long presentationId) {
+        // 1. 발표 자료 존재 여부 확인
+        Presentation presentation = presentationRepository.findById(presentationId)
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 발표 자료입니다."));
+
+        // 2. 해당 발표에 속한 슬라이드들과 각 슬라이드의 최신 대본을 슬라이드 순서(slideOrder)대로 정렬하여 조회
+        List<PresentationResponseDTO.SlideScriptDTO> slideScripts = presentation.getSlides().stream()
+                .map(slide -> {
+                    // 각 슬라이드별로 가장 최신 버전의 대본을 가져옴
+                    Script latestScript = slide.getScripts().stream()
+                            .max(Comparator.comparing(Script::getVersion))
+                            .orElse(null);
+
+                    return PresentationResponseDTO.SlideScriptDTO.builder()
+                            .slideId(slide.getSlideId())
+                            .slideOrder(slide.getSlideOrder())
+                            .slideTitle(slide.getSlideTitle())
+                            .rawText(slide.getRawText())
+                            .scriptId(latestScript != null ? latestScript.getScriptId() : null)
+                            .content(latestScript != null ? latestScript.getContent() : "")
+                            .version(latestScript != null ? latestScript.getVersion() : 1)
+                            .build();
+                })
+                .sorted(Comparator.comparing(PresentationResponseDTO.SlideScriptDTO::getSlideOrder))
+                .collect(Collectors.toList());
+
+        // 3. 전체 대본을 하나로 매끄럽게 이어 붙인 통짜 텍스트 생성 (녹음 화면에서 한눈에 띄우기 용도)
+        String combinedFullScript = slideScripts.stream()
+                .map(PresentationResponseDTO.SlideScriptDTO::getContent)
+                .filter(content -> content != null && !content.isBlank())
+                .collect(Collectors.joining("\n\n")); // 슬라이드 대본 사이를 보기 좋게 띄움
+
+        // 4. 프론트엔드로 전달할 DTO 형태로 반환
+        return PresentationResponseDTO.FullScriptViewDTO.builder()
+                .presentationId(presentation.getPresentationId())
+                .topic(presentation.getTopic())
+                .duration(presentation.getDuration())
+                .fileUrl(presentation.getFileUrl())
+                .combinedScript(combinedFullScript) // 이어 붙인 전체 대본 텍스트
+                .slideScripts(slideScripts)         // 슬라이드별 세부 대본 리스트 (필요 시 활용)
+                .build();
     }
 }

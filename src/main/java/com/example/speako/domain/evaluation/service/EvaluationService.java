@@ -3,9 +3,9 @@ package com.example.speako.domain.evaluation.service;
 import com.example.speako.domain.evaluation.dto.AiEvaluationResponseDto;
 import com.example.speako.domain.evaluation.entity.Evaluation;
 import com.example.speako.domain.evaluation.repository.EvaluationRepository;
-import com.example.speako.domain.recording.entity.VoiceRecording; // 녹음 엔티티 임포트
-import com.example.speako.domain.script.entity.Script;
-import com.example.speako.domain.script.repository.ScriptRepository;
+import com.example.speako.domain.presentation.entity.Presentation; // 👈 Presentation 엔티티 임포트
+import com.example.speako.domain.presentation.repository.PresentationRepository; // 👈 PresentationRepository 임포트
+import com.example.speako.domain.recording.entity.VoiceRecording;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -29,7 +29,7 @@ import java.io.IOException;
 @RequiredArgsConstructor
 public class EvaluationService {
 
-    private final ScriptRepository scriptRepository;
+    private final PresentationRepository presentationRepository;
     private final EvaluationRepository evaluationRepository;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -44,15 +44,14 @@ public class EvaluationService {
         }
     }
 
-    // ⚠️ @Transactional을 일부러 뺐다 — AI 호출이 최대 600초라 트랜잭션 안에서 부르면
-    //  DB 커넥션을 10분 붙잡는다. 연관 로딩은 fetch join 쿼리가 미리 끝내둔다.
-    public Evaluation evaluateVoice(Long userId, Long scriptId, MultipartFile file, VoiceRecording savedRecording) {
+    // scriptId 대신 presentationId를 받도록 변경
+    public Evaluation evaluateVoice(Long userId, Long presentationId, MultipartFile file, VoiceRecording savedRecording) {
 
-        // 1. 대본 + 슬라이드 + 발표(aiProjectId)까지 한 번에 조회
-        Script script = scriptRepository.findWithSlideAndPresentation(scriptId)
-                .orElseThrow(() -> new IllegalArgumentException("해당 대본을 찾을 수 없습니다."));
+        // 1. 발표 자료(Presentation)를 직접 조회하여 aiProjectId 획득
+        Presentation presentation = presentationRepository.findById(presentationId)
+                .orElseThrow(() -> new IllegalArgumentException("해당 발표 자료를 찾을 수 없습니다."));
 
-        Long aiProjectId = script.getSlide().getPresentation().getAiProjectId();
+        Long aiProjectId = presentation.getAiProjectId();
         if (aiProjectId == null) {
             throw new IllegalStateException(
                     "이 발표에는 AI 프로젝트 번호가 없습니다. (aiProjectId 컬럼 도입 전에 만든 옛 데이터 — 발표 자료를 다시 업로드해주세요)");
@@ -110,11 +109,11 @@ public class EvaluationService {
             throw new IllegalStateException("AI 서버 응답이 비어 있습니다.");
         }
 
-        // 5. DB 저장 (VoiceRecording 연동 포함)
+        // 5. DB 저장 (slideId 대신 presentationId 매핑)
         Evaluation evaluation = Evaluation.builder()
                 .userId(userId)
-                .slideId(script.getSlide().getSlideId())
-                .recordingId(savedRecording != null ? savedRecording.getRecordingId() : null) // 👈 객체가 아닌 ID(Long)를 넣습니다.
+                .presentationId(presentation.getPresentationId()) // 👈 slideId 대신 presentationId 저장
+                .recordingId(savedRecording != null ? savedRecording.getRecordingId() : null)
                 .audioFileName(filename)
                 .audioDuration(savedRecording != null ? savedRecording.getDuration() : 15)
                 .totalScore(aiResult.getOverallScores().getPronunciationScore())

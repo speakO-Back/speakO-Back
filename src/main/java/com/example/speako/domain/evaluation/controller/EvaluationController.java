@@ -25,15 +25,15 @@ public class EvaluationController {
     @PostMapping(value = "/record", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<ApiResponse<Evaluation>> evaluateRecording(
             @RequestParam("userId") Long userId,
-            @RequestParam("scriptId") Long scriptId,
+            @RequestParam("presentationId") Long presentationId, // 👈 scriptId -> presentationId 변경
             @RequestParam("file") MultipartFile file
     ) {
         try {
             // 1단계: 프론트에서 받은 녹음 파일을 S3에 저장하고 VoiceRecording 엔티티 획득
-            VoiceRecording savedRecording = voiceRecordingService.saveRecording(userId, scriptId, file);
+            VoiceRecording savedRecording = voiceRecordingService.saveRecording(userId, presentationId, file);
 
             // 2단계: 파이썬 AI 서버 연동을 거쳐 최종 평가 결과(Evaluation) 생성 및 DB 저장
-            Evaluation evaluation = evaluationService.evaluateVoice(userId, scriptId, file, savedRecording);
+            Evaluation evaluation = evaluationService.evaluateVoice(userId, presentationId, file, savedRecording);
 
             // 3단계: 최종 결과 반환
             return ResponseEntity.ok(ApiResponse.onSuccess(evaluation));

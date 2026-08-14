@@ -74,4 +74,15 @@ public class PresentationController {
         return ResponseEntity.ok(ApiResponse.onSuccess(
                 presentationService.regenerateOne(presentationId, scriptId, tone, extra, currentScript)));
     }
+
+    //.전체 대본 보기
+    @GetMapping("/{presentationId}/full-script")
+    public ResponseEntity<PresentationResponseDTO.FullScriptViewDTO> getFullScript(
+            @PathVariable Long presentationId) {
+
+        PresentationResponseDTO.FullScriptViewDTO response =
+                presentationService.getFullScriptForRecording(presentationId);
+
+        return ResponseEntity.ok(response);
+    }
 }
