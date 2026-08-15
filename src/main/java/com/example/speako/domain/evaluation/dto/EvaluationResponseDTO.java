@@ -28,6 +28,10 @@ public class EvaluationResponseDTO {
         private float pauseScore;
         private Object pauseDetail; // JSON 데이터
         private String recognizedText;
+
+        private String referenceText;       // AI가 준 원본 텍스트 (원본 하이라이팅용)
+        private Object wordsDetail;         // 틀린 단어 및 span 정보 (JSON 또는 List 형태)
+
         private String feedbackDetail;
         private LocalDateTime evaluatedAt;
     }

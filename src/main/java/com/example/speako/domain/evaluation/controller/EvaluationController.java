@@ -1,5 +1,6 @@
 package com.example.speako.domain.evaluation.controller;
 
+import com.example.speako.domain.evaluation.dto.EvaluationResponseDTO;
 import com.example.speako.domain.evaluation.entity.Evaluation;
 import com.example.speako.domain.evaluation.service.EvaluationService;
 import com.example.speako.domain.recording.entity.VoiceRecording;
@@ -23,20 +24,31 @@ public class EvaluationController {
     private final EvaluationService evaluationService;
 
     @PostMapping(value = "/record", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<ApiResponse<Evaluation>> evaluateRecording(
+    public ResponseEntity<ApiResponse<EvaluationResponseDTO.ResultDTO>> evaluateRecording(
             @RequestParam("userId") Long userId,
-            @RequestParam("presentationId") Long presentationId, // 👈 scriptId -> presentationId 변경
-            @RequestParam("file") MultipartFile file
+            @RequestParam(value = "presentationId", required = false) Long presentationId,
+            @RequestParam(value = "scriptFile", required = false) MultipartFile scriptFile,
+            @RequestParam(value = "scriptText", required = false) String scriptText,
+            @RequestParam("file") MultipartFile audioFile
     ) {
         try {
-            // 1단계: 프론트에서 받은 녹음 파일을 S3에 저장하고 VoiceRecording 엔티티 획득
-            VoiceRecording savedRecording = voiceRecordingService.saveRecording(userId, presentationId, file);
+            Long targetPresentationId = presentationId;
 
-            // 2단계: 파이썬 AI 서버 연동을 거쳐 최종 평가 결과(Evaluation) 생성 및 DB 저장
-            Evaluation evaluation = evaluationService.evaluateVoice(userId, presentationId, file, savedRecording);
+            if (targetPresentationId == null) {
+                if ((scriptFile == null || scriptFile.isEmpty()) && (scriptText == null || scriptText.isBlank())) {
+                    throw new IllegalArgumentException("presentationId, 대본 파일, 혹은 텍스트 중 하나는 반드시 제공되어야 합니다.");
+                }
+                targetPresentationId = evaluationService.createPresentationForCustomScript(userId, scriptFile, scriptText);
+            }
+
+            // 1단계: 녹음 파일 S3 저장
+            VoiceRecording savedRecording = voiceRecordingService.saveRecording(userId, targetPresentationId, audioFile);
+
+            // 2단계: AI 서버 연동을 통한 평가 결과 생성 및 DTO 반환
+            EvaluationResponseDTO.ResultDTO resultDto = evaluationService.evaluateVoice(userId, targetPresentationId, audioFile, savedRecording);
 
             // 3단계: 최종 결과 반환
-            return ResponseEntity.ok(ApiResponse.onSuccess(evaluation));
+            return ResponseEntity.ok(ApiResponse.onSuccess(resultDto));
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -44,4 +56,5 @@ public class EvaluationController {
                     .body(ApiResponse.onFailure("INTERNAL_SERVER_ERROR", e.getMessage()));
         }
     }
+
 }

@@ -1,5 +1,8 @@
 package com.example.speako.domain.presentation.service;
 
+import com.example.speako.domain.highlight.entity.HighlightCategory;
+import com.example.speako.domain.highlight.entity.PronunciationHighlight;
+import com.example.speako.domain.highlight.repository.PronunciationHighlightRepository;
 import com.example.speako.domain.presentation.dto.PresentationRequestDTO;
 import com.example.speako.domain.presentation.dto.PresentationResponseDTO;
 import com.example.speako.domain.presentation.entity.Presentation;
@@ -40,6 +43,7 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class PresentationService {
+    private final PronunciationHighlightRepository pronunciationHighlightRepository;
     private final UserRepository userRepository;
     private final PresentationRepository presentationRepository;
     private final ScriptRepository scriptRepository;
@@ -345,7 +349,6 @@ public class PresentationService {
         if (tone != null && !tone.isBlank()) presentation.updateTone(Presentation.Tone.valueOf(tone));
         if (extraRequirement != null) presentation.updateGuideline(extraRequirement);
 
-        // TODO: 만약 AI 서버 전체 재생성 API 규격에 currentScript를 전달해야 한다면 아래 통신 로직에 추가 가능
         callPythonAiServerForScript(presentation, presentation.getTopic(), presentation.getDuration(), presentation.getTone().name(), presentation.getGuideline());
         scriptRepository.flush();
         return getPresentationDetails(presentationId);
@@ -381,11 +384,9 @@ public class PresentationService {
         body.put("style", (tone != null && !tone.isBlank()) ? tone : presentation.getTone().name());
         body.put("extra_requirement", (extraRequirement != null && !extraRequirement.isBlank()) ? extraRequirement : presentation.getGuideline());
 
-        //  프론트엔드가 보내준 수정한 대본이 있다면 AI 서버로 함께 전달
         if (currentScript != null && !currentScript.isBlank()) {
             body.put("current_script", currentScript);
         } else {
-            // 전달받은 게 없다면 DB에 있는 기존 최신 대본 내용 전송
             body.put("current_script", script.getContent());
         }
 
@@ -407,17 +408,15 @@ public class PresentationService {
 
         return getPresentationDetails(presentationId);
     }
+
     //전체 대본 생성
     @Transactional(readOnly = true)
     public PresentationResponseDTO.FullScriptViewDTO getFullScriptForRecording(Long presentationId) {
-        // 1. 발표 자료 존재 여부 확인
         Presentation presentation = presentationRepository.findById(presentationId)
                 .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 발표 자료입니다."));
 
-        // 2. 해당 발표에 속한 슬라이드들과 각 슬라이드의 최신 대본을 슬라이드 순서(slideOrder)대로 정렬하여 조회
         List<PresentationResponseDTO.SlideScriptDTO> slideScripts = presentation.getSlides().stream()
                 .map(slide -> {
-                    // 각 슬라이드별로 가장 최신 버전의 대본을 가져옴
                     Script latestScript = slide.getScripts().stream()
                             .max(Comparator.comparing(Script::getVersion))
                             .orElse(null);
@@ -435,20 +434,219 @@ public class PresentationService {
                 .sorted(Comparator.comparing(PresentationResponseDTO.SlideScriptDTO::getSlideOrder))
                 .collect(Collectors.toList());
 
-        // 3. 전체 대본을 하나로 매끄럽게 이어 붙인 통짜 텍스트 생성 (녹음 화면에서 한눈에 띄우기 용도)
         String combinedFullScript = slideScripts.stream()
                 .map(PresentationResponseDTO.SlideScriptDTO::getContent)
                 .filter(content -> content != null && !content.isBlank())
-                .collect(Collectors.joining("\n\n")); // 슬라이드 대본 사이를 보기 좋게 띄움
+                .collect(Collectors.joining("\n\n"));
 
-        // 4. 프론트엔드로 전달할 DTO 형태로 반환
         return PresentationResponseDTO.FullScriptViewDTO.builder()
                 .presentationId(presentation.getPresentationId())
                 .topic(presentation.getTopic())
                 .duration(presentation.getDuration())
                 .fileUrl(presentation.getFileUrl())
-                .combinedScript(combinedFullScript) // 이어 붙인 전체 대본 텍스트
-                .slideScripts(slideScripts)         // 슬라이드별 세부 대본 리스트 (필요 시 활용)
+                .combinedScript(combinedFullScript)
+                .slideScripts(slideScripts)
                 .build();
+    }
+
+    /**
+     * 커스텀 대본 등록 (파일 업로드 또는 수기 텍스트 입력)
+     */
+    @Transactional
+    public Long createPresentationForCustomScript(String email, MultipartFile scriptFile, String scriptText, String topic) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+        if ((scriptFile == null || scriptFile.isEmpty()) && (scriptText == null || scriptText.isBlank())) {
+            throw new IllegalArgumentException("대본 파일이나 수기 텍스트 중 하나는 반드시 입력해야 합니다.");
+        }
+
+        String fileName = "수기 작성 대본";
+        Presentation.FileType fileType = Presentation.FileType.pdf;
+        float fileSizeMB = 0.0f;
+        String fileUrl = "";
+
+        if (scriptFile != null && !scriptFile.isEmpty()) {
+            fileName = scriptFile.getOriginalFilename();
+            if (fileName == null || !fileName.contains(".")) {
+                throw new IllegalArgumentException("유효하지 않은 파일명입니다.");
+            }
+
+            String extension = fileName.substring(fileName.lastIndexOf(".") + 1).toLowerCase();
+            if (!extension.equals("docx") && !extension.equals("txt") && !extension.equals("pdf")) {
+                throw new IllegalArgumentException("지원하지 않는 파일 형식입니다. (docx, txt, pdf만 가능)");
+            }
+
+            long maxFileSize = 20 * 1024 * 1024;
+            if (scriptFile.getSize() > maxFileSize) {
+                throw new IllegalArgumentException("대본 파일 용량은 최대 20MB를 초과할 수 없습니다.");
+            }
+
+            fileSizeMB = (float) scriptFile.getSize() / (1024 * 1024);
+            fileType = extension.equals("pdf") ? Presentation.FileType.pdf : Presentation.FileType.ppt;
+
+            fileUrl = s3Service.uploadFile(scriptFile);
+        } else {
+            fileUrl = "https://s3.amazonaws.com/speako-presentations/custom-text-" + System.currentTimeMillis() + ".txt";
+        }
+
+        Long aiProjectId = generateAiProjectIdForCustom(scriptText, scriptFile);
+
+        Presentation presentation = Presentation.builder()
+                .user(user)
+                .fileName(fileName)
+                .fileType(fileType)
+                .fileSize(fileSizeMB)
+                .slideCount(1)
+                .aiProjectId(aiProjectId)
+                .topic(topic != null && !topic.isBlank() ? topic : "커스텀 대본 발표")
+                .duration(60)
+                .tone(Presentation.Tone.formal)
+                .guideline("")
+                .fileUrl(fileUrl)
+                .build();
+
+        presentationRepository.save(presentation);
+
+        String scriptContent = "";
+        if (scriptText != null && !scriptText.isBlank()) {
+            scriptContent = scriptText;
+        } else if (scriptFile != null && !scriptFile.isEmpty()) {
+            try {
+                scriptContent = new String(scriptFile.getBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                scriptContent = "파일 내용을 읽어올 수 없습니다.";
+            }
+        }
+
+        Slide slide = Slide.builder()
+                .presentation(presentation)
+                .slideOrder(1)
+                .slideTitle("커스텀 대본")
+                .rawText(scriptContent)
+                .build();
+        slideRepository.save(slide);
+
+        Script script = Script.builder()
+                .slide(slide)
+                .content(scriptContent)
+                .version(1)
+                .build();
+        scriptRepository.save(script);
+
+        requestAndSaveHighlights(aiProjectId, script);
+
+        return presentation.getPresentationId();
+    }
+
+    // ai한테 하이라이팅 받아 오는 메서드
+    @SuppressWarnings("unchecked")
+    private void requestAndSaveHighlights(Long aiProjectId, Script script) {
+        RestTemplate restTemplate = new RestTemplate();
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(10_000);
+        factory.setReadTimeout(30_000);
+        restTemplate.setRequestFactory(factory);
+
+        HttpHeaders headers = new HttpHeaders();
+        addApiKeyHeader(headers);
+        HttpEntity<Void> requestEntity = new HttpEntity<>(headers);
+
+        try {
+            ResponseEntity<Map> response = restTemplate.exchange(
+                    AI_BASE_URL + "/api/project/" + aiProjectId + "/highlights",
+                    HttpMethod.GET,
+                    requestEntity,
+                    Map.class
+            );
+
+            Map responseBody = response.getBody();
+            if (responseBody != null && responseBody.containsKey("highlights")) {
+                List<Map<String, Object>> highlightList = (List<Map<String, Object>>) responseBody.get("highlights");
+
+                for (Map<String, Object> h : highlightList) {
+                    String categoryStr = (String) h.get("category");
+                    HighlightCategory category = HighlightCategory.MISMATCH; // 기본값으로 채울 안전한 Enum 선택
+
+                    try {
+                        if (categoryStr != null && !categoryStr.isBlank()) {
+                            category = HighlightCategory.valueOf(categoryStr.toUpperCase());
+                        }
+                    } catch (IllegalArgumentException e) {
+                        // AI가 정의되지 않은 카테고리를 보냈을 때 로그를 남기고 기본값(MISMATCH 등)으로 처리
+                        System.err.println("알 수 없는 카테고리 값 수신: " + categoryStr + ", 기본값으로 대체합니다.");
+                    }
+
+                    PronunciationHighlight highlight = PronunciationHighlight.builder()
+                            .script(script)
+                            .word((String) h.get("word"))
+                            .standardPronunciation((String) h.get("standard_pronunciation"))
+                            .category(category)
+                            .ruleDesc((String) h.get("rule_desc"))
+                            .positionStart(Integer.parseInt(String.valueOf(h.get("position_start"))))
+                            .positionEnd(Integer.parseInt(String.valueOf(h.get("position_end"))))
+                            .build();
+
+                    pronunciationHighlightRepository.save(highlight);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("하이라이팅 결과 수신 실패: " + e.getMessage());
+        }
+    }
+
+    /**
+     * AI 서버의 커스텀 대본 등록 엔드포인트 연동 후 project_id 반환
+     */
+    private Long generateAiProjectIdForCustom(String scriptText, MultipartFile scriptFile) {
+        RestTemplate restTemplate = new RestTemplate();
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(10_000);
+        factory.setReadTimeout(30_000);
+        restTemplate.setRequestFactory(factory);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        addApiKeyHeader(headers);
+
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+
+        if (scriptFile != null && !scriptFile.isEmpty()) {
+            try {
+                byte[] fileBytes = scriptFile.getBytes();
+                String filename = scriptFile.getOriginalFilename() != null ? scriptFile.getOriginalFilename() : "script.txt";
+
+                body.add("file", new ByteArrayResource(fileBytes) {
+                    @Override
+                    public String getFilename() {
+                        return filename;
+                    }
+                });
+            } catch (IOException e) {
+                throw new RuntimeException("대본 파일 읽기 실패", e);
+            }
+        }
+
+        if (scriptText != null && !scriptText.isBlank()) {
+            body.add("text", scriptText);
+        }
+
+        try {
+            ResponseEntity<Map> response = restTemplate.postForEntity(
+                    AI_BASE_URL + "/api/project/create-custom",
+                    new HttpEntity<>(body, headers),
+                    Map.class
+            );
+
+            Map responseBody = response.getBody();
+            if (responseBody == null || !responseBody.containsKey("project_id")) {
+                throw new IllegalStateException("AI 서버로부터 프로젝트 ID를 받아오지 못했습니다: " + responseBody);
+            }
+
+            return ((Number) responseBody.get("project_id")).longValue();
+
+        } catch (HttpStatusCodeException e) {
+            throw new ResponseStatusException(e.getStatusCode(), "AI 서버 커스텀 프로젝트 생성 실패: " + extractDetail(e.getResponseBodyAsString()));
+        }
     }
 }
