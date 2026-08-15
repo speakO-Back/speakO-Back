@@ -20,7 +20,7 @@ public class Evaluation {
     private Long evaluationId;
 
     private Long userId;
-    private Long slideId;
+    private Long presentationId; // 👈 slideId에서 변경
     private Long recordingId;
 
     private String audioFileName;
@@ -42,10 +42,14 @@ public class Evaluation {
     @Column(columnDefinition = "TEXT")
     private String recognizedText;
 
+    @Column(columnDefinition = "json") // 👈 DB에 추가하신 컬럼 반영
+    private String highlightDetail;
+
     @Column(columnDefinition = "TEXT")
     private String feedbackDetail;
-
+    @Builder.Default
     private LocalDateTime evaluatedAt = LocalDateTime.now();
+
     @PrePersist
     void onCreate() {
         if (this.evaluatedAt == null) this.evaluatedAt = LocalDateTime.now();
@@ -53,5 +57,6 @@ public class Evaluation {
         if (this.pauseScore == null) this.pauseScore = 0f;
         if (this.fillerWordDetail == null) this.fillerWordDetail = "[]";
         if (this.pauseDetail == null) this.pauseDetail = "[]";
+        if (this.highlightDetail == null) this.highlightDetail = "[]"; // 👈 초기값 설정 (선택사항)
     }
 }

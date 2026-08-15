@@ -74,4 +74,29 @@ public class PresentationController {
         return ResponseEntity.ok(ApiResponse.onSuccess(
                 presentationService.regenerateOne(presentationId, scriptId, tone, extra, currentScript)));
     }
+
+    //5.전체 대본 보기
+    @GetMapping("/{presentationId}/full-script")
+    public ResponseEntity<PresentationResponseDTO.FullScriptViewDTO> getFullScript(
+            @PathVariable Long presentationId) {
+
+        PresentationResponseDTO.FullScriptViewDTO response =
+                presentationService.getFullScriptForRecording(presentationId);
+
+        return ResponseEntity.ok(response);
+    }
+    // 6. 커스텀 대본 등록 (파일 또는 수기 텍스트 입력)
+    @PostMapping(value = "/custom", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<ApiResponse<PresentationResponseDTO.DetailDTO>> createCustomPresentation(
+            @RequestPart(value = "scriptFile", required = false) MultipartFile scriptFile,
+            @RequestPart(value = "scriptText", required = false) String scriptText,
+            @RequestParam(value = "topic", required = false, defaultValue = "커스텀 대본 발표") String topic,
+            @AuthenticationPrincipal String email
+    ) {
+        // 서비스 단에서 이메일로 유저를 찾고, 파일/텍스트 처리 및 AI 프로젝트 생성을 수행하도록 구현
+        Long presentationId = presentationService.createPresentationForCustomScript(email, scriptFile, scriptText, topic);
+        PresentationResponseDTO.DetailDTO response = presentationService.getPresentationDetails(presentationId);
+
+        return ResponseEntity.ok(ApiResponse.onSuccess(response));
+    }
 }

@@ -19,11 +19,12 @@ public class VoiceRecording {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long recordingId;
 
-    private Long scriptId;
+    private Long presentationId;
     private Long userId;
 
     private String audioFileUrl;
     private Integer duration;
 
+    @Builder.Default
     private LocalDateTime recordedAt = LocalDateTime.now();
 }

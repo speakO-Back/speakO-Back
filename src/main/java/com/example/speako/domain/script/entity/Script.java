@@ -1,5 +1,6 @@
 package com.example.speako.domain.script.entity;
 
+import com.example.speako.domain.highlight.entity.PronunciationHighlight;
 import com.example.speako.domain.presentation.entity.Slide;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -7,6 +8,8 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
 
 @Entity
 @Table(name = "scripts")
@@ -27,7 +30,7 @@ public class Script {
     @Column(columnDefinition = "TEXT")
     private String content;
 
-    // ✨ 빌더 사용 시 null이 들어가도 기본값이 깨지지 않게 설정
+    // 빌더 사용 시 null이 들어가도 기본값이 깨지지 않게 설정
     @Builder.Default
     private Integer version = 1;
 
@@ -42,6 +45,11 @@ public class Script {
     private LocalDateTime updatedAt;
 
     public enum RegenType { init, full, partial }
+
+    //  Script 객체에서 바로 연결된 하이라이트 목록을 조회가능
+    @Builder.Default
+    @OneToMany(mappedBy = "script", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<PronunciationHighlight> pronunciationHighlights = new ArrayList<>();
 
     @PrePersist
     void prePersist() {
